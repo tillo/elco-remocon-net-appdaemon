@@ -443,8 +443,11 @@ class Remocon(hass.Hass):
             return
         try:
             session = self._login()
+            # useCache must be False: a True read after a SetData returns stale values
+            # and breaks any constraint check that depends on the freshly-written counterpart
+            # (e.g. chReducedTemp must be <= chComfortTemp; ditto dhwReduced <= dhwComfort).
             payload = {
-                "useCache": True,
+                "useCache": False,
                 "zone": zone,
                 "filter": {"progIds": "null", "plant": True, "zone": True},
             }
@@ -526,6 +529,26 @@ class Remocon(hass.Hass):
             if int(converted) == int(current):
                 self.log(f"{entity}: no-op ({new} matches current); skipping SetData")
                 return
+
+        # BSB enforces reduced <= comfort for both DHW and CH. The cloud will accept the
+        # write (return ok:true) but silently revert the boiler — and on the next poll the
+        # cached counterpart can come back stale, corrupting future writes. Guard locally.
+        plant = self.last_writable["plantData"]
+        zone = self.last_writable["zoneData"]
+        constraint_violation = None
+        if field == "chComfortTemp" and converted < float(zone["chReducedTemp"]["value"]):
+            constraint_violation = f"chComfort {converted} < chReduced {zone['chReducedTemp']['value']}"
+        elif field == "chReducedTemp" and converted > float(zone["chComfortTemp"]["value"]):
+            constraint_violation = f"chReduced {converted} > chComfort {zone['chComfortTemp']['value']}"
+        elif field == "dhwComfortTemp" and converted < float(plant["dhwReducedTemp"]["value"]):
+            constraint_violation = f"dhwComfort {converted} < dhwReduced {plant['dhwReducedTemp']['value']}"
+        elif field == "dhwReducedTemp" and converted > float(plant["dhwComfortTemp"]["value"]):
+            constraint_violation = f"dhwReduced {converted} > dhwComfort {plant['dhwComfortTemp']['value']}"
+
+        if constraint_violation:
+            self.error(f"{entity}: refusing write — would violate boiler constraint ({constraint_violation}). "
+                       f"Adjust the counterpart helper first.")
+            return
 
         self.last_writable[block][field] = {"value": converted}
         self._post_setdata(reason=f"{entity} → {new}")

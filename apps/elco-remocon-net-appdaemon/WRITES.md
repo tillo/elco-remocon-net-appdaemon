@@ -106,6 +106,13 @@ plant. Adjust if your hardware reports different limits.
   `:-( Bsb parameters read/write error from GW <gw>: <ids>` (HTTP 599) because
   read-only datapoints can't be written. Only the six writable fields above
   may appear in the payload.
+- The BSB controller enforces `reduced <= comfort` for both DHW and CH pairs.
+  The cloud accepts violating writes with `ok: true` but silently reverts at
+  the boiler (the cloud often returns stale cached values for several seconds
+  after a reverted write, hence we always poll with `useCache: false`). The
+  module rejects locally any write that would violate the constraint — adjust
+  the counterpart helper first. To raise both: bump comfort first, then
+  reduced. To lower both: bump reduced first, then comfort.
 - The two-helper pattern (`*_set` for control, `sensor.elco_*` for state) is
   intentional. The state sensors continue to reflect what the boiler reports;
   the `*_set` helpers reflect the most recent user-requested value.

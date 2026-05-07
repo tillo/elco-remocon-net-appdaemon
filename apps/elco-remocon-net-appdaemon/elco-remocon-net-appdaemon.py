@@ -6,6 +6,27 @@ from urllib.parse import quote, urljoin
 import posixpath
 
 
+# zoneData.mode encoding (BSB)
+ZONE_MODE_TO_INT = {"Protection": 0, "Automatic": 1, "Reduced": 2, "Comfort": 3}
+ZONE_MODE_TO_TEXT = {v: k for k, v in ZONE_MODE_TO_INT.items()}
+
+# plantData.dhwMode encoding (BSB)
+DHW_MODE_TO_INT = {"Off": 0, "On": 1}
+DHW_MODE_TO_TEXT = {v: k for k, v in DHW_MODE_TO_INT.items()}
+
+# HA writable-control entities → (block, field, kind)
+# block: "plantData" | "zoneData"
+# kind:  "temp" (number)  |  "zone_mode" (4-way text)  |  "dhw_mode" (2-way text)
+WRITE_CONTROLS = {
+    "input_number.elco_dhw_comfort_temp_set":  ("plantData", "dhwComfortTemp",  "temp"),
+    "input_number.elco_dhw_reduced_temp_set":  ("plantData", "dhwReducedTemp",  "temp"),
+    "input_select.elco_dhw_mode_set":          ("plantData", "dhwMode",         "dhw_mode"),
+    "input_number.elco_ch_comfort_temp_set":   ("zoneData",  "chComfortTemp",   "temp"),
+    "input_number.elco_ch_reduced_temp_set":   ("zoneData",  "chReducedTemp",   "temp"),
+    "input_select.elco_zone_mode_set":         ("zoneData",  "mode",            "zone_mode"),
+}
+
+
 class Remocon(hass.Hass):
     def initialize(self):
         refresh_rate = self.args.get("refresh_rate")
@@ -13,27 +34,37 @@ class Remocon(hass.Hass):
             refresh_rate = 60
         self.log(f"Will fetch remocon.net data every {refresh_rate} min")
         self.run_every(self.get_remocon_data, datetime.now(), refresh_rate * 60)
+
+        # cache of writable values from the latest GetData; used to build SetData payloads
+        # since SetData requires both plantData and zoneData blocks.
+        self.last_writable = None
+
         # fetch data immediately on startup
-        self.log("Fetching remocon.net data immediately on startup")        
+        self.log("Fetching remocon.net data immediately on startup")
         self.get_remocon_data(None)
+
+        # register write listeners if enabled
+        if self.args.get("enable_writes", False):
+            self.log("Write controls enabled — registering input_number/input_select listeners")
+            for entity_id in WRITE_CONTROLS:
+                self.listen_state(self.on_control_changed, entity_id)
+        else:
+            self.log("Write controls disabled (set enable_writes: true in apps.yaml to enable)")
+
         self.log("Fetching remocon.net data completed")
+
+    # ----- READ PATH (unchanged behavior; refactored to share session helpers) -----
 
     def post_to_entities(self, data):
         self.log("Posting to entities...")
 
         def _post_data(sensor, payload):
             try:
-                # elco_sensor = self.get_entity(sensor)
-                # if elco_sensor is None:
                 entity_url = f"{ha_url}/api/states/{sensor}"
                 token = "Bearer {}".format(self.args["bearer_token"])
                 headers = {"Authorization": token, "Content-Type": "application/json"}
                 requests.post(entity_url, json=payload, headers=headers)
                 self.log(f"Set state on entity {sensor}")
-                # else:
-                #     elco_sensor.set_state(state = payload["state"], attributes = payload["attributes"])
-                #     self.log(f"update state of {sensor}")
-
             except Exception as e:
                 self.log(e)
 
@@ -352,63 +383,139 @@ class Remocon(hass.Hass):
         _post_plantData(data["plantData"])
         _post_zoneData(data["zoneData"])
 
+        # cache writable values for SetData payloads
+        self.last_writable = {
+            "plantData": {
+                "dhwComfortTemp": {"value": data["plantData"]["dhwComfortTemp"]["value"]},
+                "dhwReducedTemp": {"value": data["plantData"]["dhwReducedTemp"]["value"]},
+                "dhwMode":        {"value": data["plantData"]["dhwMode"]["value"]},
+            },
+            "zoneData": {
+                "zone": self.args.get("zone") or 1,
+                "chComfortTemp": {"value": data["zoneData"]["chComfortTemp"]["value"]},
+                "chReducedTemp": {"value": data["zoneData"]["chReducedTemp"]["value"]},
+                "mode":          {"value": data["zoneData"]["mode"]["value"]},
+            },
+        }
+
+    # ----- SHARED HELPERS -----
+
+    def _base_url(self):
+        return self.args.get("base_url") or "https://www.remocon-net.remotethermo.com"
+
+    def _login(self):
+        """Open a session, log in, return the authenticated requests.Session."""
+        base_url = self._base_url()
+        username = quote(self.args.get("username"), safe="")
+        password = quote(self.args.get("password"), safe="")
+        login_url = urljoin(base_url, "R2/Account/Login?returnUrl=HTTP/2")
+        payload = f"Email={username}&Password={password}&RememberMe=false"
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Cookie": "browserUtcOffset=-120",
+        }
+        session = requests.session()
+        response = session.post(url=login_url, headers=headers, data=payload)
+        if response.status_code != 200:
+            raise RuntimeError(f"Authentication HTTP {response.status_code}: {response.text[:200]}")
+        result = json.loads(response.text)
+        if not result.get("ok"):
+            raise RuntimeError(f"Authentication rejected: {result.get('message')}")
+        return session
+
+    # ----- READ PATH (preserved external interface) -----
+
     def get_remocon_data(self, kwargs):
         self.log("Fetching remocon data...")
         try:
-            base_url = self.args.get("base_url")
-            if base_url is None:
-                base_url = "https://www.remocon-net.remotethermo.com"
-            zone = self.args.get("zone")
-            if zone is None:
-                zone = 1
+            base_url = self._base_url()
+            zone = self.args.get("zone") or 1
             gateway = self.args.get("gateway_id")
             if not gateway:
-                self.error(
-                    "There was a problem getting configuration values, gateway_id is not defined. Aborting."
-                )
+                self.error("There was a problem getting configuration values, gateway_id is not defined. Aborting.")
                 return
-
-            username = quote(self.args.get("username"), safe="")
-            password = quote(self.args.get("password"), safe="")
         except Exception:
             self.error("There was a problem getting configuration values. Aborting.")
             return
         try:
-            login_url = urljoin(base_url, "R2/Account/Login?returnUrl=HTTP/2")
-            payload = f"Email={username}&Password={password}&RememberMe=false"
-            headers = {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Cookie": "browserUtcOffset=-120",
+            session = self._login()
+            payload = {
+                "useCache": True,
+                "zone": zone,
+                "filter": {"progIds": "null", "plant": True, "zone": True},
             }
-            session = requests.session()
-            # login, get session cookie and address for json data
-            response = session.post(url=login_url, headers=headers, data=payload)
+            data_url = urljoin(base_url, posixpath.join("R2/PlantHomeBsb/GetData", gateway))
+            self.log(f"Parameters gatewayId: {gateway} zone: {payload}")
+            response = session.post(url=data_url, json=payload)
             if response.status_code == 200:
                 result_json = json.loads(response.text)
-                if result_json["ok"]:
-                    # get zone data
-                    payload = {
-                        "useCache": True,
-                        "zone": zone,
-                        "filter": {"progIds": "null", "plant": True, "zone": True},
-                    }
-                    data_url = urljoin(
-                        base_url, posixpath.join("R2/PlantHomeBsb/GetData", gateway)
-                    )
-                    self.log(f"Parameters gatewayId: {gateway} zone: {payload}")
-                    response = session.post(url=data_url, json=payload)
-                    if response.status_code == 200:
-                        result_json = json.loads(response.text)
-                        self.post_to_entities(result_json["data"])
-                        self.log("Done fetching remocon data.")
-                    else:
-                        error_message = response.text
-                        self.error(f"Fetching error: {error_message}")
-                else:
-                    error_message = result_json["message"]
-                    self.error(f"Authentication failed: {error_message}")
+                self.post_to_entities(result_json["data"])
+                self.log("Done fetching remocon data.")
             else:
-                error_message = response.text
-                self.error(f"Authentication error: {error_message}")
+                self.error(f"Fetching error: {response.text}")
         except Exception as e:
             self.error(f"Unhandled exception: {e}")
+
+    # ----- WRITE PATH -----
+
+    def on_control_changed(self, entity, attribute, old, new, kwargs):
+        """Listener for input_number / input_select changes. Pushes the new value to remocon-net."""
+        if old == new or new in ("unavailable", "unknown", None):
+            return
+        if entity not in WRITE_CONTROLS:
+            return
+        if not self.last_writable:
+            self.error(f"{entity}: cannot write — no GetData snapshot cached yet")
+            return
+
+        block, field, kind = WRITE_CONTROLS[entity]
+        try:
+            if kind == "temp":
+                value = float(new)
+                self.last_writable[block][field] = {"value": value}
+            elif kind == "zone_mode":
+                value = ZONE_MODE_TO_INT.get(new)
+                if value is None:
+                    self.error(f"{entity}: unknown zone mode '{new}' (expected {list(ZONE_MODE_TO_INT)})")
+                    return
+                self.last_writable[block][field] = {"value": value}
+            elif kind == "dhw_mode":
+                value = DHW_MODE_TO_INT.get(new)
+                if value is None:
+                    self.error(f"{entity}: unknown DHW mode '{new}' (expected {list(DHW_MODE_TO_INT)})")
+                    return
+                self.last_writable[block][field] = {"value": value}
+        except (ValueError, TypeError) as e:
+            self.error(f"{entity}: bad value '{new}': {e}")
+            return
+
+        self._post_setdata(reason=f"{entity} → {new}")
+
+    def _post_setdata(self, reason):
+        gateway = self.args.get("gateway_id")
+        if not gateway:
+            self.error("Cannot write: gateway_id not configured")
+            return
+
+        payload = {
+            "plantData": self.last_writable["plantData"],
+            "zoneData": self.last_writable["zoneData"],
+            "viewModel": {"zoneNumber": self.last_writable["zoneData"]["zone"]},
+        }
+        url = urljoin(self._base_url(), posixpath.join("R2/PlantHomeBsb/SetData", gateway))
+        self.log(f"SetData ({reason}): payload={json.dumps(payload)}")
+        try:
+            session = self._login()
+            response = session.post(url=url, json=payload)
+            if response.status_code != 200:
+                self.error(f"SetData HTTP {response.status_code}: {response.text[:300]}")
+                return
+            result = json.loads(response.text)
+            if not result.get("ok"):
+                self.error(f"SetData rejected: {result.get('message')} (debug: {result.get('debugMessage')})")
+                return
+            self.log(f"SetData ok ({reason})")
+            # refresh sensors a few seconds later so HA reflects the new state
+            self.run_in(self.get_remocon_data, 5)
+        except Exception as e:
+            self.error(f"SetData exception: {e}")

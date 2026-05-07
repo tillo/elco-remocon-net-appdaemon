@@ -1,0 +1,116 @@
+stages:
+  - refresh
+  - deploy
+  - notify
+
+# refresh: scheduled job that fetches nechry/main from GitHub, merges into our
+# fork's main, and pushes. A successful push triggers a follow-up pipeline that
+# runs the deploy stage (which regenerates the fleet ConfigMap and pushes the
+# fleet repo). Manual web triggers also fire this stage.
+#
+# Required CI variables (project-scoped):
+#   ELCO_PUSH_TOKEN   Project Access Token on this repo, write_repository scope
+#   FLEET_PUSH_TOKEN  Project Access Token on mdapi/fleet, write_repository scope
+#   PUSHOVER_API_TOKEN / PUSHOVER_USER_KEY are inherited from the mdapi group.
+refresh:
+  image: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/alpine:latest
+  stage: refresh
+  tags:
+    - mdapi
+  variables:
+    GIT_DEPTH: 0
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+  before_script:
+    - apk add --no-cache git curl
+  script:
+    - git config user.email "ci-bot@gitlab.mdapi.ch"
+    - git config user.name "GitLab CI"
+    - git remote set-url origin "https://oauth2:${ELCO_PUSH_TOKEN}@gitlab.mdapi.ch/mdapi/elco-remocon-net-appdaemon.git"
+    - git remote add upstream https://github.com/nechry/elco-remocon-net-appdaemon || git remote set-url upstream https://github.com/nechry/elco-remocon-net-appdaemon
+    - git fetch upstream
+    - git checkout -B main origin/main
+    - UPSTREAM_COUNT=$(git rev-list --count main..upstream/main 2>/dev/null || echo 0)
+    - UPSTREAM_LOG=$(git log --oneline main..upstream/main 2>/dev/null | head -5 || true)
+    - git merge --no-edit upstream/main || { git merge --abort; echo "CONFLICT merging upstream/main"; exit 1; }
+    - |
+      if [ "$(git rev-parse main)" = "$(git rev-parse origin/main)" ]; then
+        echo "Already up to date — nothing to push"
+      else
+        git push origin main
+        MSG=$(printf 'Upstream merged into elco-remocon-net-appdaemon — deploy will follow.\n\nnechry/main (%s):\n%s' "$UPSTREAM_COUNT" "$UPSTREAM_LOG")
+        curl -sf \
+          --form-string "token=$PUSHOVER_API_TOKEN" \
+          --form-string "user=$PUSHOVER_USER_KEY" \
+          --form-string "title=ELCO Remocon: upstream merged" \
+          --form-string "message=$MSG" \
+          https://api.pushover.net/1/messages.json
+      fi
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" = "failed" ]; then
+        apk add --no-cache curl -q 2>/dev/null || true
+        curl -sf \
+          --form-string "token=$PUSHOVER_API_TOKEN" \
+          --form-string "user=$PUSHOVER_USER_KEY" \
+          --form-string "title=ELCO Remocon: refresh failed" \
+          --form-string "message=$(printf 'Upstream merge or push failed — manual intervention needed.\n%s' "$CI_PIPELINE_URL")" \
+          --form-string "priority=1" \
+          https://api.pushover.net/1/messages.json || true
+      fi
+
+# deploy-fleet: regenerate the AppDaemon ConfigMap in the fleet repo from the
+# python source in this repo, commit + push fleet. Fleet's reconcile loop
+# updates the K8s ConfigMap on mdapi-prod; AppDaemon hot-reloads from the
+# volume mount (/conf/apps/elco). End-to-end ~30s after the fleet push.
+deploy-fleet:
+  image: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/python:3.13-alpine
+  stage: deploy
+  tags:
+    - mdapi
+  rules:
+    # Schedule pipelines have no commit yet at this stage — the refresh's push
+    # spawns a fresh pipeline whose source is "push", and that's when we deploy.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+  before_script:
+    - apk add --no-cache git curl
+    - pip install --quiet pyyaml
+  script:
+    - git config --global user.email "ci-bot@gitlab.mdapi.ch"
+    - git config --global user.name "GitLab CI"
+    - git clone --depth 1 "https://oauth2:${FLEET_PUSH_TOKEN}@gitlab.mdapi.ch/mdapi/fleet.git" /tmp/fleet
+    - export ELCO_REPO="$CI_PROJECT_DIR"
+    - python3 /tmp/fleet/appdaemon/regen-elco-app-cm.py
+    - cd /tmp/fleet
+    - |
+      if git diff --quiet appdaemon/appdaemon-elco-app-cm.yml; then
+        echo "ConfigMap already in sync with this commit — nothing to push"
+        exit 0
+      fi
+    - SHORT_SHA=$(echo "$CI_COMMIT_SHA" | cut -c1-8)
+    - git add appdaemon/appdaemon-elco-app-cm.yml
+    - git commit -m "appdaemon: regenerate elco-app CM (elco $SHORT_SHA)" -m "Automated by elco-remocon-net-appdaemon CI ($CI_PIPELINE_URL)"
+    - git push origin main
+    - |
+      curl -sf \
+        --form-string "token=$PUSHOVER_API_TOKEN" \
+        --form-string "user=$PUSHOVER_USER_KEY" \
+        --form-string "title=ELCO Remocon: fleet CM updated" \
+        --form-string "message=$(printf 'Fleet CM regenerated from elco %s.\n%s' "$SHORT_SHA" "$CI_PIPELINE_URL")" \
+        https://api.pushover.net/1/messages.json
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" = "failed" ]; then
+        apk add --no-cache curl -q 2>/dev/null || true
+        curl -sf \
+          --form-string "token=$PUSHOVER_API_TOKEN" \
+          --form-string "user=$PUSHOVER_USER_KEY" \
+          --form-string "title=ELCO Remocon: deploy-fleet failed" \
+          --form-string "message=$(printf 'Fleet ConfigMap regen or push failed.\n%s' "$CI_PIPELINE_URL")" \
+          --form-string "priority=1" \
+          https://api.pushover.net/1/messages.json || true
+      fi

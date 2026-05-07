@@ -106,13 +106,27 @@ plant. Adjust if your hardware reports different limits.
   `:-( Bsb parameters read/write error from GW <gw>: <ids>` (HTTP 599) because
   read-only datapoints can't be written. Only the six writable fields above
   may appear in the payload.
-- The BSB controller enforces `reduced <= comfort` for both DHW and CH pairs.
-  The cloud accepts violating writes with `ok: true` but silently reverts at
-  the boiler (the cloud often returns stale cached values for several seconds
-  after a reverted write, hence we always poll with `useCache: false`). The
-  module rejects locally any write that would violate the constraint — adjust
-  the counterpart helper first. To raise both: bump comfort first, then
-  reduced. To lower both: bump reduced first, then comfort.
+- **CH schedule-slot temperatures (chComfortTemp, chReducedTemp) are NOT
+  writable via `PlantHomeBsb/SetData`.** The cloud accepts the request with
+  `ok: true` but the boiler does not honor the new values, and the cloud's
+  cached register for these fields can desync from boiler reality (in some
+  sequences it ends up reporting `4.0` with inverted min/max sentinels). The
+  module's CH helpers (`input_number.elco_ch_*_temp_set`) refuse writes
+  locally with a log line; the helpers continue to be primed from current
+  cloud state for read visibility. CH writes will require the
+  `PlantTimeProgBsb/SetTemperature` endpoint, which is not yet decoded.
+  Until then, change CH comfort/reduced via the Remocon Net mobile app or
+  the physical LMS14 panel.
+- DHW writes (`dhwComfortTemp`, `dhwReducedTemp`, `dhwMode`) and zone-mode
+  writes (`mode.value`) via `PlantHomeBsb/SetData` work and stick. The
+  payload sent never includes CH temps, regardless of which helper changed.
+- The BSB controller enforces `reduced <= comfort` for the DHW pair (and the
+  CH pair, but we don't write CH). Local guard rejects violating writes
+  with `ok: true` lies from the cloud — adjust the counterpart first.
+- All polls use `useCache: false`. A `useCache: true` read after a SetData
+  returns stale cloud-cached values for several seconds, and the cached
+  `last_writable` would diverge from boiler state, breaking constraint checks
+  on the next write.
 - The two-helper pattern (`*_set` for control, `sensor.elco_*` for state) is
   intentional. The state sensors continue to reflect what the boiler reports;
   the `*_set` helpers reflect the most recent user-requested value.

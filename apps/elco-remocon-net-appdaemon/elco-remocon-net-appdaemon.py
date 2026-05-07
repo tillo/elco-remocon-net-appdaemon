@@ -502,6 +502,22 @@ class Remocon(hass.Hass):
             self.error(f"{entity}: cannot write — no GetData snapshot cached yet")
             return
 
+        # CH schedule-slot temperatures (chComfort/chReduced) are NOT writable via
+        # PlantHomeBsb/SetData. The cloud accepts the call with ok:true but the boiler
+        # does not honor the change — and the corresponding cloud-side register can
+        # silently desync from the boiler. Until PlantTimeProgBsb/SetTemperature is
+        # reverse-engineered, refuse these writes locally; the helper will re-prime
+        # on the next poll.
+        if entity in ("input_number.elco_ch_comfort_temp_set",
+                      "input_number.elco_ch_reduced_temp_set"):
+            self.error(
+                f"{entity}: CH temperature writes are not yet supported (PlantHomeBsb/SetData "
+                f"does not honor schedule-slot temps; SetTemperature endpoint pending). "
+                f"Set CH comfort/reduced via the Remocon Net app for now. "
+                f"Helper will re-prime to {self.last_writable['zoneData'][WRITE_CONTROLS[entity][1]]['value']} on next poll."
+            )
+            return
+
         block, field, kind = WRITE_CONTROLS[entity]
         try:
             if kind == "temp":
@@ -559,10 +575,23 @@ class Remocon(hass.Hass):
             self.error("Cannot write: gateway_id not configured")
             return
 
+        plant = self.last_writable["plantData"]
+        zone = self.last_writable["zoneData"]
+        # Include only fields we actually want to write. PlantHomeBsb/SetData requires
+        # both plantData and zoneData blocks, but extra fields like chComfortTemp /
+        # chReducedTemp must be omitted: the cloud accepts them with ok:true but does
+        # not propagate to the boiler and can corrupt the cloud-side cache.
         payload = {
-            "plantData": self.last_writable["plantData"],
-            "zoneData": self.last_writable["zoneData"],
-            "viewModel": {"zoneNumber": self.last_writable["zoneData"]["zone"]},
+            "plantData": {
+                "dhwComfortTemp": {"value": plant["dhwComfortTemp"]["value"]},
+                "dhwReducedTemp": {"value": plant["dhwReducedTemp"]["value"]},
+                "dhwMode":        {"value": plant["dhwMode"]["value"]},
+            },
+            "zoneData": {
+                "zone": zone["zone"],
+                "mode": {"value": zone["mode"]["value"]},
+            },
+            "viewModel": {"zoneNumber": zone["zone"]},
         }
         url = urljoin(self._base_url(), posixpath.join("R2/PlantHomeBsb/SetData", gateway))
         self.log(f"SetData ({reason}): payload={json.dumps(payload)}")

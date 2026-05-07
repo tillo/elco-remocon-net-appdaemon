@@ -38,6 +38,9 @@ class Remocon(hass.Hass):
         # cache of writable values from the latest GetData; used to build SetData payloads
         # since SetData requires both plantData and zoneData blocks.
         self.last_writable = None
+        # full zoneData/plantData snapshots required by SetTemperature (CH temps endpoint).
+        self.last_full_zoneData = None
+        self.last_full_plantData = None
 
         # fetch data immediately on startup
         self.log("Fetching remocon.net data immediately on startup")
@@ -397,6 +400,11 @@ class Remocon(hass.Hass):
                 "mode":          {"value": data["zoneData"]["mode"]["value"]},
             },
         }
+        # Full plant/zone snapshots are needed by the SetTemperature endpoint, which
+        # writes CH schedule-slot temps via /R2/PlantTimeProgBsb/SetTemperature/<gw>
+        # with payload {zoneNum, comfort, reduced, plantData:null, zoneData:<full>}.
+        self.last_full_zoneData = data["zoneData"]
+        self.last_full_plantData = data["plantData"]
 
         # prime HA helpers (input_number / input_select) so they mirror reality
         if self.args.get("enable_writes", False):
@@ -502,22 +510,6 @@ class Remocon(hass.Hass):
             self.error(f"{entity}: cannot write — no GetData snapshot cached yet")
             return
 
-        # CH schedule-slot temperatures (chComfort/chReduced) are NOT writable via
-        # PlantHomeBsb/SetData. The cloud accepts the call with ok:true but the boiler
-        # does not honor the change — and the corresponding cloud-side register can
-        # silently desync from the boiler. Until PlantTimeProgBsb/SetTemperature is
-        # reverse-engineered, refuse these writes locally; the helper will re-prime
-        # on the next poll.
-        if entity in ("input_number.elco_ch_comfort_temp_set",
-                      "input_number.elco_ch_reduced_temp_set"):
-            self.error(
-                f"{entity}: CH temperature writes are not yet supported (PlantHomeBsb/SetData "
-                f"does not honor schedule-slot temps; SetTemperature endpoint pending). "
-                f"Set CH comfort/reduced via the Remocon Net app for now. "
-                f"Helper will re-prime to {self.last_writable['zoneData'][WRITE_CONTROLS[entity][1]]['value']} on next poll."
-            )
-            return
-
         block, field, kind = WRITE_CONTROLS[entity]
         try:
             if kind == "temp":
@@ -567,7 +559,62 @@ class Remocon(hass.Hass):
             return
 
         self.last_writable[block][field] = {"value": converted}
-        self._post_setdata(reason=f"{entity} → {new}")
+
+        # Route CH temps to SetTemperature (the schedule-slot temp endpoint), not SetData.
+        # SetData accepts those fields with ok:true but does not propagate to the boiler
+        # and can corrupt the cloud-side register.
+        if field in ("chComfortTemp", "chReducedTemp"):
+            new_comfort = float(zone["chComfortTemp"]["value"])
+            new_reduced = float(zone["chReducedTemp"]["value"])
+            if field == "chComfortTemp":
+                new_comfort = converted
+            else:
+                new_reduced = converted
+            self._post_settemperature(new_comfort, new_reduced, reason=f"{entity} → {new}")
+        else:
+            self._post_setdata(reason=f"{entity} → {new}")
+
+    def _post_settemperature(self, new_comfort, new_reduced, reason):
+        """Write CH schedule-slot temps via /R2/PlantTimeProgBsb/SetTemperature/<gw>.
+
+        Payload shape (decoded from the dashboard's `je` constructor):
+            {zoneNum, comfort, reduced, plantData: null, zoneData: <full current zoneData>}
+
+        Both `comfort` and `reduced` must be present in every call — the cloud uses them
+        together to update the schedule's slot setpoints. Pass current values for whichever
+        side is not changing.
+        """
+        gateway = self.args.get("gateway_id")
+        if not gateway:
+            self.error("Cannot write: gateway_id not configured")
+            return
+        if not self.last_full_zoneData:
+            self.error("Cannot write CH temps: no zoneData snapshot cached yet")
+            return
+
+        payload = {
+            "zoneNum": self.last_writable["zoneData"]["zone"],
+            "comfort": new_comfort,
+            "reduced": new_reduced,
+            "plantData": None,
+            "zoneData": self.last_full_zoneData,
+        }
+        url = urljoin(self._base_url(), posixpath.join("R2/PlantTimeProgBsb/SetTemperature", gateway))
+        self.log(f"SetTemperature ({reason}): comfort={new_comfort}, reduced={new_reduced}")
+        try:
+            session = self._login()
+            response = session.post(url=url, json=payload)
+            if response.status_code != 200:
+                self.error(f"SetTemperature HTTP {response.status_code}: {response.text[:300]}")
+                return
+            result = json.loads(response.text)
+            if not result.get("ok"):
+                self.error(f"SetTemperature rejected: {result.get('message')} (debug: {result.get('debugMessage')})")
+                return
+            self.log(f"SetTemperature ok ({reason})")
+            self.run_in(self.get_remocon_data, 5)
+        except Exception as e:
+            self.error(f"SetTemperature exception: {e}")
 
     def _post_setdata(self, reason):
         gateway = self.args.get("gateway_id")

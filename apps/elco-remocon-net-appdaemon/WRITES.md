@@ -109,20 +109,34 @@ plant. Adjust if your hardware reports different limits.
 - **CH schedule-slot temperatures (chComfortTemp, chReducedTemp) are NOT
   writable via `PlantHomeBsb/SetData`.** The cloud accepts the request with
   `ok: true` but the boiler does not honor the new values, and the cloud's
-  cached register for these fields can desync from boiler reality (in some
-  sequences it ends up reporting `4.0` with inverted min/max sentinels). The
-  module's CH helpers (`input_number.elco_ch_*_temp_set`) refuse writes
-  locally with a log line; the helpers continue to be primed from current
-  cloud state for read visibility. CH writes will require the
-  `PlantTimeProgBsb/SetTemperature` endpoint, which is not yet decoded.
-  Until then, change CH comfort/reduced via the Remocon Net mobile app or
-  the physical LMS14 panel.
+  cached register can silently desync (a no-op echo of 19.5/16.5 has been
+  observed to leave the cloud reporting 4.0/4.0 with inverted min/max
+  sentinels). The module routes CH temp helper changes to the dedicated
+  schedule-slot endpoint instead:
+
+      POST /R2/PlantTimeProgBsb/SetTemperature/<gw>
+      {
+        "zoneNum":   <zone>,
+        "comfort":   <new comfort °C>,
+        "reduced":   <new reduced °C>,
+        "plantData": null,
+        "zoneData":  <full current zoneData object>
+      }
+
+  Both `comfort` and `reduced` must be present every call (pass the current
+  value for whichever side is not changing); `zoneData` must be the full
+  freshly-fetched object — not the slim writable subset used by SetData.
+  Payload-shape source: dashboard JS, `je` constructor in
+  `Scripts/R2/app.bundle.min.js` — `this.zoneNum=e, this.comfort=t,
+  this.reduced=n, this.plantData=r, this.zoneData=i`.
 - DHW writes (`dhwComfortTemp`, `dhwReducedTemp`, `dhwMode`) and zone-mode
-  writes (`mode.value`) via `PlantHomeBsb/SetData` work and stick. The
-  payload sent never includes CH temps, regardless of which helper changed.
-- The BSB controller enforces `reduced <= comfort` for the DHW pair (and the
-  CH pair, but we don't write CH). Local guard rejects violating writes
-  with `ok: true` lies from the cloud — adjust the counterpart first.
+  writes (`mode.value`) go through `PlantHomeBsb/SetData`, which works for
+  those fields. The SetData payload deliberately omits CH temps so DHW
+  writes can never accidentally clobber CH state.
+- The BSB controller enforces `reduced <= comfort` for both the DHW pair
+  and the CH pair. Local guard rejects violating writes (cloud accepts
+  them with a misleading `ok: true` and silently reverts the boiler) —
+  adjust the counterpart helper first.
 - All polls use `useCache: false`. A `useCache: true` read after a SetData
   returns stale cloud-cached values for several seconds, and the cached
   `last_writable` would diverge from boiler state, breaking constraint checks

@@ -398,6 +398,10 @@ class Remocon(hass.Hass):
             },
         }
 
+        # prime HA helpers (input_number / input_select) so they mirror reality
+        if self.args.get("enable_writes", False):
+            self._prime_helpers()
+
     # ----- SHARED HELPERS -----
 
     def _base_url(self):
@@ -458,9 +462,36 @@ class Remocon(hass.Hass):
 
     # ----- WRITE PATH -----
 
+    def _prime_helpers(self):
+        """Push current writable values into the HA helper entities so they reflect reality.
+        Listener treats an incoming change that already matches cache as a no-op, so this
+        does not feed back into a write."""
+        plant = self.last_writable["plantData"]
+        zone = self.last_writable["zoneData"]
+        targets = [
+            ("input_number", "input_number.elco_dhw_comfort_temp_set", float(plant["dhwComfortTemp"]["value"])),
+            ("input_number", "input_number.elco_dhw_reduced_temp_set", float(plant["dhwReducedTemp"]["value"])),
+            ("input_number", "input_number.elco_ch_comfort_temp_set",  float(zone["chComfortTemp"]["value"])),
+            ("input_number", "input_number.elco_ch_reduced_temp_set",  float(zone["chReducedTemp"]["value"])),
+            ("input_select", "input_select.elco_zone_mode_set", ZONE_MODE_TO_TEXT.get(zone["mode"]["value"])),
+            ("input_select", "input_select.elco_dhw_mode_set",  DHW_MODE_TO_TEXT.get(plant["dhwMode"]["value"])),
+        ]
+        for domain, entity_id, value in targets:
+            if value is None:
+                continue
+            try:
+                if domain == "input_number":
+                    self.call_service("input_number/set_value", entity_id=entity_id, value=value)
+                else:
+                    self.call_service("input_select/select_option", entity_id=entity_id, option=value)
+            except Exception as e:
+                self.log(f"prime {entity_id} failed: {e}")
+
     def on_control_changed(self, entity, attribute, old, new, kwargs):
-        """Listener for input_number / input_select changes. Pushes the new value to remocon-net."""
-        if old == new or new in ("unavailable", "unknown", None):
+        """Listener for input_number / input_select changes. Pushes the new value to remocon-net.
+        No-op when the change already matches the cached current value (covers our own primes
+        and user toggles that land back on the live state)."""
+        if new in ("unavailable", "unknown", None):
             return
         if entity not in WRITE_CONTROLS:
             return
@@ -471,24 +502,32 @@ class Remocon(hass.Hass):
         block, field, kind = WRITE_CONTROLS[entity]
         try:
             if kind == "temp":
-                value = float(new)
-                self.last_writable[block][field] = {"value": value}
+                converted = float(new)
             elif kind == "zone_mode":
-                value = ZONE_MODE_TO_INT.get(new)
-                if value is None:
+                converted = ZONE_MODE_TO_INT.get(new)
+                if converted is None:
                     self.error(f"{entity}: unknown zone mode '{new}' (expected {list(ZONE_MODE_TO_INT)})")
                     return
-                self.last_writable[block][field] = {"value": value}
             elif kind == "dhw_mode":
-                value = DHW_MODE_TO_INT.get(new)
-                if value is None:
+                converted = DHW_MODE_TO_INT.get(new)
+                if converted is None:
                     self.error(f"{entity}: unknown DHW mode '{new}' (expected {list(DHW_MODE_TO_INT)})")
                     return
-                self.last_writable[block][field] = {"value": value}
         except (ValueError, TypeError) as e:
             self.error(f"{entity}: bad value '{new}': {e}")
             return
 
+        current = self.last_writable[block][field]["value"]
+        if kind == "temp":
+            if abs(converted - float(current)) < 1e-3:
+                self.log(f"{entity}: no-op ({new} matches current); skipping SetData")
+                return
+        else:
+            if int(converted) == int(current):
+                self.log(f"{entity}: no-op ({new} matches current); skipping SetData")
+                return
+
+        self.last_writable[block][field] = {"value": converted}
         self._post_setdata(reason=f"{entity} → {new}")
 
     def _post_setdata(self, reason):

@@ -197,29 +197,51 @@ mirrors whether any non-deleted holiday exists.
 
 ## Weekly schedule (read-only for now)
 
-The Remocon "Chauffage" schedule view is fetched via a second poll:
+The Remocon "Chauffage" schedule view comes back inside the existing
+`PlantHomeBsb/GetData` response when the filter explicitly requests it.
+Default `progIds: null` (or `[]`) excludes schedules from the response;
+`progIds: [<zone>]` includes the heating-zone schedule:
 
 ```
-POST /R2/PlantTimeProgBsb/GetData/<gw>
-body: {useCache: false, zone: <n>, progId: 0}
+POST /R2/PlantHomeBsb/GetData/<gw>
+body: {useCache: false, zone: 1, filter: {progIds: [1], plant: true, zone: true}}
 response: {ok: true, data: {plantData, zoneData, timeProgs: [{weeklyPlan, ...}]}}
 ```
 
-`timeProgs[0].weeklyPlan` shape (from `BsbTimeProg` / `weeklyPlan` viewmodel):
+`progIds` enum (from `Scripts/R2/app.bundle.min.js`):
+
+| Value | Programme        |
+|-------|------------------|
+| 1..6  | ChZn1..ChZn6 (heating zone 1..6) |
+| 7     | Dhw              |
+| 8     | Extra            |
+| 9..14 | CoolZn1..CoolZn6 |
+| 15,16 | Extra1, Extra2   |
+
+For a single-zone CH plant, `progIds: [zone]` is what you want.
+
+`timeProgs[0].weeklyPlan` shape:
 
 ```
 { plans: [
-    { days: [<int day-of-week>...], slices: [{from: <min from midnight>, temp: <C>}, ...] },
+    { days: [<int day-of-week>...], slices: [{from: <min from midnight>, temp: <0|1>}, ...] },
     ...
   ],
-  ext: bool,
-  maxSwitches: int
+  allowedTemp, defaultTemp, baseTemp, tick, maxSwitches, ext, pilot
 }
 ```
 
-Day numbering is `Date.getDay()` (0=Sunday). The app flattens this into 7
-sensors `sensor.elco_schedule_{monday..sunday}` whose state is the slice count
-and whose `slices` attribute carries each slot as `{from_min, from_hhmm, temp}`.
+**`slice.temp` is a 0/1 state flag, NOT a °C value.** 0 = reduced setpoint,
+1 = comfort setpoint. The actual temperatures come from `zoneData.chComfortTemp`
+and `zoneData.chReducedTemp` (BSB stores those as separate scalars; the
+schedule only encodes which setpoint applies to each slice).
+
+Day numbering is `Date.getDay()` (0=Sunday, 1=Monday, ..., 6=Saturday).
+The app flattens this into 7 sensors `sensor.elco_schedule_{monday..sunday}`,
+each carrying two attributes:
+- `slices`: raw slice list with `{from_min, from_hhmm, flag, mode, temp}`
+- `intervals`: derived `[{start_min, end_min, start_hhmm, end_hhmm, mode, temp}]`,
+  each interval ending where the next slice begins (or at 24:00 for the last).
 
 Write-back for the schedule (`PlantTimeProgBsb/SetTimeProg/<gw>`) is **not yet
 wired**. Existing CH temp writes still go through `PlantTimeProgBsb/SetTemperature`

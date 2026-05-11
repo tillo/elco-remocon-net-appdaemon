@@ -431,19 +431,22 @@ class Remocon(hass.Hass):
                     },
                 })
 
-        def _post_schedule(weeklyPlan):
+        def _post_schedule(weeklyPlan, comfort_temp, reduced_temp):
             """Publish 7 sensors (one per weekday) carrying the slice list as an
             attribute. State = number of slices for that day so HA history is useful.
 
-            weeklyPlan shape (from BsbTimeProg / `weeklyPlan` viewmodel):
+            weeklyPlan shape (from BsbTimeProgBsb GetData response):
               {
                 plans: [
-                  {days: [<int day-of-week>...], slices: [{from: <min from midnight>, temp: <C>}, ...]},
+                  {days: [<int day-of-week>...], slices: [{from: <min from midnight>, temp: <0|1>}, ...]},
                   ...
                 ],
-                ext: bool,
-                maxSwitches: int
+                allowedTemp, defaultTemp, baseTemp, tick, maxSwitches, ext, pilot
               }
+
+            `slice.temp` is a state flag (0=reduced, 1=comfort), NOT a °C value.
+            The actual °C come from zoneData.chComfortTemp / chReducedTemp.
+            Day-of-week indices use Date.getDay() — 0=Sunday, 1=Monday, ...
             """
             plans = (weeklyPlan or {}).get("plans") or []
             # Flatten: per-weekday slice list
@@ -459,16 +462,38 @@ class Remocon(hass.Hass):
                     if d in by_day:
                         by_day[d] = slices
 
+            def mode_for(flag):
+                return "comfort" if flag == 1 else "reduced"
+
+            def temp_for(flag):
+                return comfort_temp if flag == 1 else reduced_temp
+
             for day_idx, suffix in WEEKDAY_SUFFIX.items():
                 slices = by_day[day_idx]
-                # Render attributes friendly for templates: list of {from_min, from_hhmm, temp}
+                # Render two attributes for the dashboard:
+                # - `slices`: raw slice list (flag + from-minutes + HH:MM convenience)
+                # - `intervals`: derived [{start_hhmm, end_hhmm, mode, temp}, ...]
+                #   ending each at the next slice (or 24:00 for the last one)
                 rendered = []
-                for s in slices:
+                intervals = []
+                for i, s in enumerate(slices):
                     m = int(s.get("from", 0))
+                    flag = s.get("temp")
                     rendered.append({
                         "from_min": m,
                         "from_hhmm": f"{m // 60:02d}:{m % 60:02d}",
-                        "temp": s.get("temp"),
+                        "flag": flag,
+                        "mode": mode_for(flag),
+                        "temp": temp_for(flag),
+                    })
+                    end_m = int(slices[i + 1].get("from", 1440)) if (i + 1) < len(slices) else 1440
+                    intervals.append({
+                        "start_min": m,
+                        "end_min": end_m,
+                        "start_hhmm": f"{m // 60:02d}:{m % 60:02d}",
+                        "end_hhmm": f"{end_m // 60:02d}:{end_m % 60:02d}",
+                        "mode": mode_for(flag),
+                        "temp": temp_for(flag),
                     })
                 _post_data(f"sensor.elco_schedule_{suffix}", {
                     "state": len(rendered),
@@ -477,6 +502,7 @@ class Remocon(hass.Hass):
                         "icon": "mdi:calendar-clock",
                         "unit_of_measurement": "slices",
                         "slices": rendered,
+                        "intervals": intervals,
                         "ext": (weeklyPlan or {}).get("ext"),
                         "max_switches": (weeklyPlan or {}).get("maxSwitches"),
                     },
@@ -499,12 +525,15 @@ class Remocon(hass.Hass):
 
         _post_plantData(data["plantData"])
         _post_zoneData(data["zoneData"])
-        # timeProgs is only populated by PlantTimeProgBsb/GetData, not the default
-        # PlantHomeBsb/GetData. The get_remocon_data path calls into both and merges
-        # the result before invoking post_to_entities (see get_remocon_data).
+        # timeProgs is populated when get_remocon_data's payload includes
+        # filter.progIds=[<zone>]. Each timeProg's slice.temp is a 0/1 mode
+        # flag — map it to the actual °C from zoneData (BSB stores those
+        # separately as chComfortTemp / chReducedTemp scalars).
         time_progs = data.get("timeProgs") or []
         if time_progs:
-            _post_schedule((time_progs[0] or {}).get("weeklyPlan") or {})
+            comfort_c = float(data["zoneData"]["chComfortTemp"]["value"])
+            reduced_c = float(data["zoneData"]["chReducedTemp"]["value"])
+            _post_schedule((time_progs[0] or {}).get("weeklyPlan") or {}, comfort_c, reduced_c)
 
         # cache writable values for SetData payloads
         self.last_writable = {
@@ -574,10 +603,15 @@ class Remocon(hass.Hass):
             # useCache must be False: a True read after a SetData returns stale values
             # and breaks any constraint check that depends on the freshly-written counterpart
             # (e.g. chReducedTemp must be <= chComfortTemp; ditto dhwReduced <= dhwComfort).
+            # progIds: per BSB enum, 1=ChZn1 (heating zone 1), 2..6=ChZn2..ChZn6,
+            # 7=Dhw, 9..14=CoolZn1..CoolZn6. The cloud returns the requested
+            # programmes inside data.timeProgs; passing [zone] gives us the CH
+            # schedule for the current heating zone. useCache must be False —
+            # see the comment block on writes.
             payload = {
                 "useCache": False,
                 "zone": zone,
-                "filter": {"progIds": "null", "plant": True, "zone": True},
+                "filter": {"progIds": [zone], "plant": True, "zone": True},
             }
             data_url = urljoin(base_url, posixpath.join("R2/PlantHomeBsb/GetData", gateway))
             self.log(f"Parameters gatewayId: {gateway} zone: {payload}")
@@ -587,25 +621,6 @@ class Remocon(hass.Hass):
                 return
             result_json = json.loads(response.text)
             data = result_json["data"]
-
-            # Second poll: schedule (weeklyPlan) for the heating zone. The cloud
-            # exposes this via PlantTimeProgBsb/GetData/<gw>, distinct from the
-            # PlantHomeBsb/GetData call above. Failure here is non-fatal: the
-            # plant/zone sensors still update.
-            try:
-                tp_payload = {"useCache": False, "zone": zone, "progId": 0}
-                tp_url = urljoin(base_url, posixpath.join("R2/PlantTimeProgBsb/GetData", gateway))
-                tp_response = session.post(url=tp_url, json=tp_payload)
-                if tp_response.status_code == 200:
-                    tp_json = json.loads(tp_response.text)
-                    if tp_json.get("ok") and tp_json.get("data"):
-                        data["timeProgs"] = tp_json["data"].get("timeProgs") or []
-                    else:
-                        self.log(f"PlantTimeProgBsb returned ok=false: {tp_json.get('message')}")
-                else:
-                    self.log(f"PlantTimeProgBsb HTTP {tp_response.status_code}: {tp_response.text[:200]}")
-            except Exception as e:
-                self.log(f"PlantTimeProgBsb fetch failed (non-fatal): {e}")
 
             self.post_to_entities(data)
             self.log("Done fetching remocon data.")

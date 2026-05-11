@@ -1075,9 +1075,18 @@ class Remocon(hass.Hass):
         }
         url = urljoin(self._base_url(), posixpath.join("R2/PlantHomeBsb/SetData", gateway))
         self.log(f"SetData (holiday: {reason}): payload={json.dumps(payload)}")
+        # XMLHttpRequest + Ajax-Request headers match the browser capture; the
+        # cloud's ASP.NET pipeline appears to route holiday-bearing payloads
+        # differently when these are absent (the body parses fine — type
+        # discriminator works — but the viewModel.holidays mutation is dropped).
+        headers = {
+            "X-Requested-With": "XMLHttpRequest",
+            "Ajax-Request": "json",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+        }
         try:
             session = self._login()
-            response = session.post(url=url, json=payload)
+            response = session.post(url=url, json=payload, headers=headers)
             if response.status_code != 200:
                 self.error(f"Holiday SetData HTTP {response.status_code}: {response.text[:300]}")
                 return

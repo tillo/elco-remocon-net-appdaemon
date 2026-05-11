@@ -1024,23 +1024,20 @@ class Remocon(hass.Hass):
             self.log(f"Promoting zone mode {ZONE_MODE_TO_TEXT.get(zone_mode)} → Automatic for holiday")
             zone_mode = ZONE_MODE_TO_INT["Automatic"]
 
-        # Build zoneData: the full echo gets a 599 (read-only BSB params like
-        # chComfortTemp/chReducedTemp can't go via SetData), but the slim
-        # {zone, mode, holidays} echo is silently dropped. The set that works
-        # is: holiday-adjacent fields only (the holiday DTO array + the
-        # holiday-behaviour scalars + the holiday-temp fields), plus the
-        # writable zone scalars (mode + useReducedOperationModeOnHoliday).
-        # Everything else (room temp, heating-active flags, CH temps, etc.)
-        # is read-only state and must be omitted.
-        src = self.last_full_zoneData
-        full_zone = {
-            "zone": zone_cached["zone"],
-            "mode": {**(src.get("mode") or {}), "value": zone_mode},
-            "useReducedOperationModeOnHoliday": bool(src.get("useReducedOperationModeOnHoliday", False)),
-            "chHolidayTemp": src.get("chHolidayTemp", 0.0),
-            "coolHolidayTemp": src.get("coolHolidayTemp", 0.0),
-            "holidays": holidays,
-        }
+        # The dashboard JS's setHomeData() passes the FULL bsbZoneRepo.getByZone(...)
+        # object as zoneData. The cloud is fine with read-only fields being echoed
+        # as long as their values match its cache — a mismatch (e.g. after a prior
+        # corruption) triggers 599. A slim payload is silently dropped because the
+        # cloud expects the full envelope to authoritatively merge.
+        #
+        # So: mirror the JS exactly. Start from last_full_zoneData (fresh from
+        # the most recent GetData), splice in our holiday + mode mutations.
+        full_zone = dict(self.last_full_zoneData)
+        full_zone["holidays"] = holidays
+        full_zone["mode"] = {**(full_zone.get("mode") or {}), "value": zone_mode}
+        # zone field needs to be at the top level too (the BsbZoneData class
+        # has it as a scalar; the JS sends it).
+        full_zone.setdefault("zone", zone_cached["zone"])
 
         payload = {
             "plantData": {

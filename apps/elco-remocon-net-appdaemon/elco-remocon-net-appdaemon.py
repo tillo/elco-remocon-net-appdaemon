@@ -997,29 +997,41 @@ class Remocon(hass.Hass):
     def _post_holiday_setdata(self, holidays, reason):
         """POST PlantHomeBsb/SetData with the modified holidays array.
 
-        SetData echoes a partial zoneData; the cloud merges by primary key
-        (zone+index). We include the holidays array plus the minimum scalar
-        fields the endpoint requires (mode, zone) so it doesn't choke.
+        The cloud's setHomeData (Scripts/R2/app.bundle.min.js) builds
+        `{plantData, zoneData, viewModel}` from the full BsbZoneData snapshot,
+        not a slim subset. For mode-only / DHW-temp writes a slim payload
+        works, but holiday writes are silently dropped (ok:true, holidays:[])
+        unless the full zoneData echo is sent. So we splice the modified
+        holidays into the cached full snapshot before posting.
         """
         gateway = self.args.get("gateway_id")
         if not gateway:
             self.error("Cannot write holiday: gateway_id not configured")
             return
-        if not self.last_writable:
+        if not self.last_writable or not self.last_full_zoneData:
             self.error("Cannot write holiday: no GetData snapshot cached yet")
             return
 
         plant = self.last_writable["plantData"]
-        zone = self.last_writable["zoneData"]
+        zone_cached = self.last_writable["zoneData"]
         # When a holiday is active the BSB controller forces the zone into Auto;
         # without that the Remocon UI itself rejects the save (and so does the
         # cloud-side state machine). Pin the current mode unless it would
         # contradict the active flag, in which case promote to Automatic.
-        zone_mode = int(zone["mode"]["value"])
+        zone_mode = int(zone_cached["mode"]["value"])
         any_active = any(not (h or {}).get("deleted") for h in (holidays or []))
         if any_active and zone_mode != ZONE_MODE_TO_INT["Automatic"]:
             self.log(f"Promoting zone mode {ZONE_MODE_TO_TEXT.get(zone_mode)} → Automatic for holiday")
             zone_mode = ZONE_MODE_TO_INT["Automatic"]
+
+        # Build zoneData = full cached snapshot, but with our modifications
+        # applied: mode (possibly promoted) and the new holidays array.
+        full_zone = dict(self.last_full_zoneData)
+        full_zone["holidays"] = holidays
+        # mode is itself an object {value, options, ...}; only the .value moves.
+        mode_obj = dict(full_zone.get("mode") or {})
+        mode_obj["value"] = zone_mode
+        full_zone["mode"] = mode_obj
 
         payload = {
             "plantData": {
@@ -1027,12 +1039,8 @@ class Remocon(hass.Hass):
                 "dhwReducedTemp": {"value": plant["dhwReducedTemp"]["value"]},
                 "dhwMode":        {"value": plant["dhwMode"]["value"]},
             },
-            "zoneData": {
-                "zone": zone["zone"],
-                "mode": {"value": zone_mode},
-                "holidays": holidays,
-            },
-            "viewModel": {"zoneNumber": zone["zone"]},
+            "zoneData": full_zone,
+            "viewModel": {"zoneNumber": zone_cached["zone"]},
         }
         url = urljoin(self._base_url(), posixpath.join("R2/PlantHomeBsb/SetData", gateway))
         self.log(f"SetData (holiday: {reason}): payload={json.dumps(payload)}")

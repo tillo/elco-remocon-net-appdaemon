@@ -1,5 +1,5 @@
 import hassapi as hass
-from datetime import datetime
+from datetime import datetime, timedelta
 import requests
 import json
 from urllib.parse import quote, urljoin
@@ -24,6 +24,24 @@ WRITE_CONTROLS = {
     "input_number.elco_ch_comfort_temp_set":   ("zoneData",  "chComfortTemp",   "temp"),
     "input_number.elco_ch_reduced_temp_set":   ("zoneData",  "chReducedTemp",   "temp"),
     "input_select.elco_zone_mode_set":         ("zoneData",  "mode",            "zone_mode"),
+}
+
+# Holiday write controls — handled separately from WRITE_CONTROLS because they
+# mutate zoneData.holidays (an array) rather than a scalar field, and the BSB
+# state semantics (added/changed/deleted flags) are non-trivial.
+HOLIDAY_DATE_ENTITY = "input_datetime.elco_holiday_until"
+HOLIDAY_ACTIVE_ENTITY = "input_boolean.elco_holiday_active"
+
+# Weekday index → entity-id suffix. Remocon JS uses Date.getDay() (0=Sunday) for
+# the day field on schedule slices, so we mirror that.
+WEEKDAY_SUFFIX = {
+    0: "sunday",
+    1: "monday",
+    2: "tuesday",
+    3: "wednesday",
+    4: "thursday",
+    5: "friday",
+    6: "saturday",
 }
 
 
@@ -51,6 +69,10 @@ class Remocon(hass.Hass):
             self.log("Write controls enabled — registering input_number/input_select listeners")
             for entity_id in WRITE_CONTROLS:
                 self.listen_state(self.on_control_changed, entity_id)
+            # Holiday helpers — single listener; we read both entities each time
+            # one of them changes so an active=on toggle + a date pick land as one write.
+            self.listen_state(self.on_holiday_changed, HOLIDAY_DATE_ENTITY)
+            self.listen_state(self.on_holiday_changed, HOLIDAY_ACTIVE_ENTITY)
         else:
             self.log("Write controls disabled (set enable_writes: true in apps.yaml to enable)")
 
@@ -368,6 +390,98 @@ class Remocon(hass.Hass):
                 data,
             )
 
+            # holidays: array of {index, fromAsIso, toAsIso, added, changed, deleted}
+            # from BsbZoneData. The "current" holiday is the first non-deleted one.
+            holidays = zoneData.get("holidays") or []
+            current = next((h for h in holidays if not (h or {}).get("deleted")), None)
+            if current:
+                until = current.get("toAsIso")
+                _post_data("binary_sensor.elco_holiday_active", {
+                    "state": "on",
+                    "attributes": {
+                        "device_class": "running",
+                        "friendly_name": "Elco Holiday Active",
+                        "icon": "mdi:airplane",
+                        "from": current.get("fromAsIso"),
+                        "index": current.get("index"),
+                    },
+                })
+                _post_data("sensor.elco_holiday_until", {
+                    "state": until or "unknown",
+                    "attributes": {
+                        "device_class": "timestamp" if until else None,
+                        "friendly_name": "Elco Holiday Return Date",
+                        "icon": "mdi:calendar-end",
+                    },
+                })
+            else:
+                _post_data("binary_sensor.elco_holiday_active", {
+                    "state": "off",
+                    "attributes": {
+                        "device_class": "running",
+                        "friendly_name": "Elco Holiday Active",
+                        "icon": "mdi:airplane",
+                    },
+                })
+                _post_data("sensor.elco_holiday_until", {
+                    "state": "none",
+                    "attributes": {
+                        "friendly_name": "Elco Holiday Return Date",
+                        "icon": "mdi:calendar-end",
+                    },
+                })
+
+        def _post_schedule(weeklyPlan):
+            """Publish 7 sensors (one per weekday) carrying the slice list as an
+            attribute. State = number of slices for that day so HA history is useful.
+
+            weeklyPlan shape (from BsbTimeProg / `weeklyPlan` viewmodel):
+              {
+                plans: [
+                  {days: [<int day-of-week>...], slices: [{from: <min from midnight>, temp: <C>}, ...]},
+                  ...
+                ],
+                ext: bool,
+                maxSwitches: int
+              }
+            """
+            plans = (weeklyPlan or {}).get("plans") or []
+            # Flatten: per-weekday slice list
+            by_day = {d: [] for d in WEEKDAY_SUFFIX}
+            for plan in plans:
+                if not plan:
+                    continue
+                slices = sorted(
+                    [s for s in (plan.get("slices") or []) if s is not None],
+                    key=lambda s: s.get("from", 0),
+                )
+                for d in plan.get("days") or []:
+                    if d in by_day:
+                        by_day[d] = slices
+
+            for day_idx, suffix in WEEKDAY_SUFFIX.items():
+                slices = by_day[day_idx]
+                # Render attributes friendly for templates: list of {from_min, from_hhmm, temp}
+                rendered = []
+                for s in slices:
+                    m = int(s.get("from", 0))
+                    rendered.append({
+                        "from_min": m,
+                        "from_hhmm": f"{m // 60:02d}:{m % 60:02d}",
+                        "temp": s.get("temp"),
+                    })
+                _post_data(f"sensor.elco_schedule_{suffix}", {
+                    "state": len(rendered),
+                    "attributes": {
+                        "friendly_name": f"Elco Schedule {suffix.capitalize()}",
+                        "icon": "mdi:calendar-clock",
+                        "unit_of_measurement": "slices",
+                        "slices": rendered,
+                        "ext": (weeklyPlan or {}).get("ext"),
+                        "max_switches": (weeklyPlan or {}).get("maxSwitches"),
+                    },
+                })
+
         try:
             if self.args.get("ha_url"):
                 # get HA's url from app's first, if configured/overridden by user
@@ -385,6 +499,12 @@ class Remocon(hass.Hass):
 
         _post_plantData(data["plantData"])
         _post_zoneData(data["zoneData"])
+        # timeProgs is only populated by PlantTimeProgBsb/GetData, not the default
+        # PlantHomeBsb/GetData. The get_remocon_data path calls into both and merges
+        # the result before invoking post_to_entities (see get_remocon_data).
+        time_progs = data.get("timeProgs") or []
+        if time_progs:
+            _post_schedule((time_progs[0] or {}).get("weeklyPlan") or {})
 
         # cache writable values for SetData payloads
         self.last_writable = {
@@ -462,12 +582,33 @@ class Remocon(hass.Hass):
             data_url = urljoin(base_url, posixpath.join("R2/PlantHomeBsb/GetData", gateway))
             self.log(f"Parameters gatewayId: {gateway} zone: {payload}")
             response = session.post(url=data_url, json=payload)
-            if response.status_code == 200:
-                result_json = json.loads(response.text)
-                self.post_to_entities(result_json["data"])
-                self.log("Done fetching remocon data.")
-            else:
+            if response.status_code != 200:
                 self.error(f"Fetching error: {response.text}")
+                return
+            result_json = json.loads(response.text)
+            data = result_json["data"]
+
+            # Second poll: schedule (weeklyPlan) for the heating zone. The cloud
+            # exposes this via PlantTimeProgBsb/GetData/<gw>, distinct from the
+            # PlantHomeBsb/GetData call above. Failure here is non-fatal: the
+            # plant/zone sensors still update.
+            try:
+                tp_payload = {"useCache": False, "zone": zone, "progId": 0}
+                tp_url = urljoin(base_url, posixpath.join("R2/PlantTimeProgBsb/GetData", gateway))
+                tp_response = session.post(url=tp_url, json=tp_payload)
+                if tp_response.status_code == 200:
+                    tp_json = json.loads(tp_response.text)
+                    if tp_json.get("ok") and tp_json.get("data"):
+                        data["timeProgs"] = tp_json["data"].get("timeProgs") or []
+                    else:
+                        self.log(f"PlantTimeProgBsb returned ok=false: {tp_json.get('message')}")
+                else:
+                    self.log(f"PlantTimeProgBsb HTTP {tp_response.status_code}: {tp_response.text[:200]}")
+            except Exception as e:
+                self.log(f"PlantTimeProgBsb fetch failed (non-fatal): {e}")
+
+            self.post_to_entities(data)
+            self.log("Done fetching remocon data.")
         except Exception as e:
             self.error(f"Unhandled exception: {e}")
 
@@ -497,6 +638,23 @@ class Remocon(hass.Hass):
                     self.call_service("input_select/select_option", entity_id=entity_id, option=value)
             except Exception as e:
                 self.log(f"prime {entity_id} failed: {e}")
+
+        # Holiday helpers: mirror zoneData.holidays into the input_boolean +
+        # input_datetime so the dashboard reflects boiler state on startup.
+        try:
+            holidays = (self.last_full_zoneData or {}).get("holidays") or []
+            current = next((h for h in holidays if not (h or {}).get("deleted")), None)
+            if current and current.get("toAsIso"):
+                self.call_service("input_boolean/turn_on", entity_id=HOLIDAY_ACTIVE_ENTITY)
+                # toAsIso is "YYYY-MM-DDTHH:MM:SS"; input_datetime with has_date:true
+                # accepts "YYYY-MM-DD".
+                date_only = current["toAsIso"].split("T")[0]
+                self.call_service("input_datetime/set_datetime",
+                                  entity_id=HOLIDAY_DATE_ENTITY, date=date_only)
+            else:
+                self.call_service("input_boolean/turn_off", entity_id=HOLIDAY_ACTIVE_ENTITY)
+        except Exception as e:
+            self.log(f"prime holiday helpers failed: {e}")
 
     def on_control_changed(self, entity, attribute, old, new, kwargs):
         """Listener for input_number / input_select changes. Pushes the new value to remocon-net.
@@ -657,3 +815,141 @@ class Remocon(hass.Hass):
             self.run_in(self.get_remocon_data, 5)
         except Exception as e:
             self.error(f"SetData exception: {e}")
+
+    # ----- HOLIDAY WRITE PATH -----
+
+    def on_holiday_changed(self, entity, attribute, old, new, kwargs):
+        """Single listener for both input_datetime.elco_holiday_until and
+        input_boolean.elco_holiday_active. We look at both helpers each call
+        and reconcile against the cloud:
+
+        - active=on  + a future date → ensure a holiday exists with toAsIso=date
+        - active=off                  → mark current holiday deleted (cloud removes)
+
+        Mutation semantics come from the Remocon JS holidayModel (Scripts/R2/app.bundle.min.js):
+        * `set(date)`: if a current (non-deleted) holiday exists, set its
+          toAsIso=date and mark changed=true; else push a new {added:true,
+          fromAsIso:<now>, toAsIso:date, index:<len-of-array>}.
+        * `deleteCurrentHoliday()`: set the first non-deleted holiday's
+          deleted=true. The cloud removes it on the next SetData.
+        """
+        if new in ("unavailable", "unknown", None):
+            return
+        if not self.last_full_zoneData:
+            self.error("Holiday change ignored — no zoneData snapshot cached yet")
+            return
+
+        active_state = self.get_state(HOLIDAY_ACTIVE_ENTITY)
+        date_state = self.get_state(HOLIDAY_DATE_ENTITY)
+        if active_state in ("unavailable", "unknown", None):
+            self.log(f"Holiday active state unavailable ({active_state}); skipping")
+            return
+
+        want_active = (active_state == "on")
+        until_iso = None
+        if want_active:
+            if date_state in ("unavailable", "unknown", None, ""):
+                self.log(f"Holiday set to active but {HOLIDAY_DATE_ENTITY}={date_state}; "
+                         f"pick a return date to push the write")
+                return
+            # input_datetime with has_date:true, has_time:false yields "YYYY-MM-DD".
+            # The BSB cloud expects an ISO datetime (e.g. "2026-05-15T00:00:00").
+            try:
+                d = datetime.strptime(date_state, "%Y-%m-%d")
+            except ValueError:
+                try:
+                    d = datetime.fromisoformat(date_state)
+                except ValueError:
+                    self.error(f"Cannot parse {HOLIDAY_DATE_ENTITY}={date_state}")
+                    return
+            if d.date() <= datetime.now().date():
+                self.error(f"Holiday return date {d.date()} is not in the future; ignoring")
+                return
+            until_iso = d.strftime("%Y-%m-%dT%H:%M:%S")
+
+        # Build the mutated holidays array from the cached snapshot.
+        zone_data = self.last_full_zoneData
+        holidays = list(zone_data.get("holidays") or [])
+        current = next((h for h in holidays if not (h or {}).get("deleted")), None)
+
+        if want_active:
+            if current is not None:
+                if current.get("toAsIso") == until_iso:
+                    self.log(f"Holiday already set to {until_iso}; no-op")
+                    return
+                current["toAsIso"] = until_iso
+                current["changed"] = True
+            else:
+                now_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                holidays.append({
+                    "index": len(holidays),
+                    "fromAsIso": now_iso,
+                    "toAsIso": until_iso,
+                    "added": True,
+                })
+            reason = f"holiday set until {until_iso}"
+        else:
+            if current is None:
+                self.log("Holiday cleared but no active holiday — no-op")
+                return
+            current["deleted"] = True
+            reason = "holiday cleared"
+
+        self._post_holiday_setdata(holidays, reason=reason)
+
+    def _post_holiday_setdata(self, holidays, reason):
+        """POST PlantHomeBsb/SetData with the modified holidays array.
+
+        SetData echoes a partial zoneData; the cloud merges by primary key
+        (zone+index). We include the holidays array plus the minimum scalar
+        fields the endpoint requires (mode, zone) so it doesn't choke.
+        """
+        gateway = self.args.get("gateway_id")
+        if not gateway:
+            self.error("Cannot write holiday: gateway_id not configured")
+            return
+        if not self.last_writable:
+            self.error("Cannot write holiday: no GetData snapshot cached yet")
+            return
+
+        plant = self.last_writable["plantData"]
+        zone = self.last_writable["zoneData"]
+        # When a holiday is active the BSB controller forces the zone into Auto;
+        # without that the Remocon UI itself rejects the save (and so does the
+        # cloud-side state machine). Pin the current mode unless it would
+        # contradict the active flag, in which case promote to Automatic.
+        zone_mode = int(zone["mode"]["value"])
+        any_active = any(not (h or {}).get("deleted") for h in (holidays or []))
+        if any_active and zone_mode != ZONE_MODE_TO_INT["Automatic"]:
+            self.log(f"Promoting zone mode {ZONE_MODE_TO_TEXT.get(zone_mode)} → Automatic for holiday")
+            zone_mode = ZONE_MODE_TO_INT["Automatic"]
+
+        payload = {
+            "plantData": {
+                "dhwComfortTemp": {"value": plant["dhwComfortTemp"]["value"]},
+                "dhwReducedTemp": {"value": plant["dhwReducedTemp"]["value"]},
+                "dhwMode":        {"value": plant["dhwMode"]["value"]},
+            },
+            "zoneData": {
+                "zone": zone["zone"],
+                "mode": {"value": zone_mode},
+                "holidays": holidays,
+            },
+            "viewModel": {"zoneNumber": zone["zone"]},
+        }
+        url = urljoin(self._base_url(), posixpath.join("R2/PlantHomeBsb/SetData", gateway))
+        self.log(f"SetData (holiday: {reason}): payload={json.dumps(payload)}")
+        try:
+            session = self._login()
+            response = session.post(url=url, json=payload)
+            if response.status_code != 200:
+                self.error(f"Holiday SetData HTTP {response.status_code}: {response.text[:300]}")
+                return
+            result = json.loads(response.text)
+            if not result.get("ok"):
+                self.error(f"Holiday SetData rejected: {result.get('message')} (debug: {result.get('debugMessage')})")
+                return
+            self.log(f"Holiday SetData ok ({reason})")
+            self.run_in(self.get_remocon_data, 5)
+        except Exception as e:
+            self.error(f"Holiday SetData exception: {e}")

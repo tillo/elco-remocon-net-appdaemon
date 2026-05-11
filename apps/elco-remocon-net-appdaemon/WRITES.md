@@ -146,3 +146,94 @@ plant. Adjust if your hardware reports different limits.
   the `*_set` helpers reflect the most recent user-requested value.
 - If the gateway is offline, writes will succeed at the cloud layer but the
   boiler won't change until reconnect. The sensors will lag accordingly.
+
+## Holiday set/clear
+
+The "Set holiday" feature in the Remocon-NET app maps to mutations of
+`zoneData.holidays` (an array on `BsbZoneData`) that are echoed back via the
+existing `PlantHomeBsb/SetData/<gw>` endpoint. There is no separate holiday
+endpoint — the cloud merges by `zone` + `index` on each save.
+
+Per-entry shape (source: `holidayModel` in `Scripts/R2/app.bundle.min.js`):
+
+```
+{ index: <int>, fromAsIso: "YYYY-MM-DDTHH:MM:SS", toAsIso: "YYYY-MM-DDTHH:MM:SS",
+  added: bool?, changed: bool?, deleted: bool? }
+```
+
+Mutation rules (mirrored from `holidayModel.set` / `deleteCurrentHoliday`):
+
+- Setting a return date when no active holiday exists → push
+  `{index: <len>, added: true, fromAsIso: <now>, toAsIso: <return date>}`.
+- Setting a return date when a holiday already exists → update its `toAsIso`
+  and mark `changed: true`.
+- Clearing the holiday → mark the active entry `deleted: true`. The cloud
+  removes it on the next SetData.
+
+Two HA helpers drive this:
+
+```yaml
+input_boolean:
+  elco_holiday_active:
+    name: ELCO Holiday active
+    icon: mdi:airplane
+input_datetime:
+  elco_holiday_until:
+    name: ELCO Holiday return date
+    icon: mdi:calendar-end
+    has_date: true
+    has_time: false
+```
+
+A single listener watches both. When either changes, the app reconciles:
+toggling `elco_holiday_active=on` with a future date in `elco_holiday_until`
+issues an add/change; toggling `off` issues a delete. The zone mode is forced
+to `Automatic` for an active holiday — the boiler firmware refuses the save
+otherwise.
+
+Read path: `sensor.elco_holiday_until` carries the active return date
+(`toAsIso`) as a `device_class: timestamp` state, `binary_sensor.elco_holiday_active`
+mirrors whether any non-deleted holiday exists.
+
+## Weekly schedule (read-only for now)
+
+The Remocon "Chauffage" schedule view is fetched via a second poll:
+
+```
+POST /R2/PlantTimeProgBsb/GetData/<gw>
+body: {useCache: false, zone: <n>, progId: 0}
+response: {ok: true, data: {plantData, zoneData, timeProgs: [{weeklyPlan, ...}]}}
+```
+
+`timeProgs[0].weeklyPlan` shape (from `BsbTimeProg` / `weeklyPlan` viewmodel):
+
+```
+{ plans: [
+    { days: [<int day-of-week>...], slices: [{from: <min from midnight>, temp: <C>}, ...] },
+    ...
+  ],
+  ext: bool,
+  maxSwitches: int
+}
+```
+
+Day numbering is `Date.getDay()` (0=Sunday). The app flattens this into 7
+sensors `sensor.elco_schedule_{monday..sunday}` whose state is the slice count
+and whose `slices` attribute carries each slot as `{from_min, from_hhmm, temp}`.
+
+Write-back for the schedule (`PlantTimeProgBsb/SetTimeProg/<gw>`) is **not yet
+wired**. Existing CH temp writes still go through `PlantTimeProgBsb/SetTemperature`
+(see above).
+
+## Cloud-side fields that are NOT exposed for BSB plants
+
+The `BsbPlantData` class (Remocon JS bundle) declares these fields:
+`outsideTemp, hasOutsideTempProbe, dhwComfortTemp, dhwReducedTemp, dhwMode,
+dhwEnabled, flameSensor, heatPumpOn, dhwStorageTemp, dhwStorageTempError,
+hasDhwStorageProbe, outsideTempError, isDhwProgReadOnly`.
+
+There is **no boiler flow/return water temperature** in the BSB data model.
+The "current temperature" shown in the Remocon hot-water screen is the DHW
+tank probe (`dhwStorageTemp` → `sensor.elco_domestic_hot_water_storage_temperature`).
+For room temperature, use `sensor.elco_room_temperature`. There is no third
+"boiler water" temp available from this API surface.

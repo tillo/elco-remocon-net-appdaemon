@@ -1,0 +1,285 @@
+## Remocon-NET-style Home Assistant dashboard
+##
+## Paste each top-level block below into a separate "Manual card" on a new
+## Lovelace dashboard, or import the whole `views:` block as a YAML-mode
+## dashboard.
+##
+## Required entities (created by the AppDaemon app):
+##   sensor.elco_room_temperature, sensor.elco_outside_temperature,
+##   sensor.elco_desired_room_temperature, sensor.elco_room_operation_mode_heating,
+##   sensor.elco_domestic_hot_water_storage_temperature, sensor.elco_domestic_hot_water_temperature,
+##   sensor.elco_holiday_until, sensor.elco_schedule_{monday..sunday},
+##   binary_sensor.elco_flame_sensor, binary_sensor.elco_heatpump_on,
+##   binary_sensor.elco_room_heating_is_active, binary_sensor.elco_holiday_active
+##
+## Required helpers (HA configuration.yaml — see fleet/home-assistant/home-assistant-cm.yml):
+##   input_number.elco_ch_comfort_temp_set, input_number.elco_ch_reduced_temp_set,
+##   input_number.elco_dhw_comfort_temp_set, input_number.elco_dhw_reduced_temp_set,
+##   input_select.elco_zone_mode_set, input_select.elco_dhw_mode_set,
+##   input_boolean.elco_holiday_active, input_datetime.elco_holiday_until
+##
+## HACS dependencies (optional — schedule card uses apexcharts):
+##   - custom:apexcharts-card  (https://github.com/RomRider/apexcharts-card)
+##   Without it, swap the schedule card for the markdown fallback at the bottom.
+
+title: Chauffage
+path: chauffage
+icon: mdi:radiator
+cards:
+  ##################################################################
+  # 1) Top status row — outside temp, flame, heating active
+  ##################################################################
+  - type: horizontal-stack
+    cards:
+      - type: tile
+        entity: sensor.elco_outside_temperature
+        name: Outside
+        icon: mdi:thermometer
+        color: blue
+      - type: tile
+        entity: binary_sensor.elco_flame_sensor
+        name: Flame
+        icon: mdi:fire
+        color: orange
+        state_content: state
+      - type: tile
+        entity: binary_sensor.elco_room_heating_is_active
+        name: Heating
+        icon: mdi:radiator
+        color: red
+
+  ##################################################################
+  # 2) Main Chauffage card — gauge with room temp, current desired temp,
+  #    +/- buttons that nudge the comfort setpoint, then 4 mode buttons.
+  ##################################################################
+  - type: vertical-stack
+    cards:
+      - type: gauge
+        entity: sensor.elco_room_temperature
+        name: Home temperature
+        min: 5
+        max: 30
+        needle: true
+        segments:
+          - from: 5
+            color: '#3b82f6'
+          - from: 15
+            color: '#facc15'
+          - from: 19
+            color: '#f97316'
+          - from: 23
+            color: '#dc2626'
+      - type: glance
+        show_name: true
+        show_state: true
+        columns: 3
+        entities:
+          - entity: sensor.elco_desired_room_temperature
+            name: Setpoint
+          - entity: sensor.elco_comfort_room_temperature_setpoint
+            name: Comfort
+          - entity: sensor.elco_reduced_room_temperature_setpoint
+            name: Reduced
+
+      # +/- nudge buttons (0.5 °C) on the comfort setpoint
+      - type: horizontal-stack
+        cards:
+          - type: button
+            name: '−'
+            icon: mdi:minus
+            tap_action:
+              action: call-service
+              service: input_number.set_value
+              target:
+                entity_id: input_number.elco_ch_comfort_temp_set
+              data:
+                value: >-
+                  {{ (states('input_number.elco_ch_comfort_temp_set') | float - 0.5) | round(1) }}
+          - type: button
+            entity: input_number.elco_ch_comfort_temp_set
+            name: Comfort setpoint
+            show_state: true
+          - type: button
+            name: '+'
+            icon: mdi:plus
+            tap_action:
+              action: call-service
+              service: input_number.set_value
+              target:
+                entity_id: input_number.elco_ch_comfort_temp_set
+              data:
+                value: >-
+                  {{ (states('input_number.elco_ch_comfort_temp_set') | float + 0.5) | round(1) }}
+
+      # 4 mode buttons — same look as the Remocon AUTO / COMFORT / REDUCED / OFF row.
+      # tap_action calls input_select.select_option; the AppDaemon write listener
+      # propagates the change to the boiler.
+      - type: horizontal-stack
+        cards:
+          - type: button
+            name: Auto
+            icon: mdi:clock-outline
+            tap_action:
+              action: call-service
+              service: input_select.select_option
+              target:
+                entity_id: input_select.elco_zone_mode_set
+              data: { option: Automatic }
+            state_color: true
+            entity: input_select.elco_zone_mode_set
+          - type: button
+            name: Comfort
+            icon: mdi:weather-sunny
+            tap_action:
+              action: call-service
+              service: input_select.select_option
+              target:
+                entity_id: input_select.elco_zone_mode_set
+              data: { option: Comfort }
+            state_color: true
+            entity: input_select.elco_zone_mode_set
+          - type: button
+            name: Reduced
+            icon: mdi:weather-night
+            tap_action:
+              action: call-service
+              service: input_select.select_option
+              target:
+                entity_id: input_select.elco_zone_mode_set
+              data: { option: Reduced }
+            state_color: true
+            entity: input_select.elco_zone_mode_set
+          - type: button
+            name: Off
+            icon: mdi:power
+            tap_action:
+              action: call-service
+              service: input_select.select_option
+              target:
+                entity_id: input_select.elco_zone_mode_set
+              data: { option: Protection }
+            state_color: true
+            entity: input_select.elco_zone_mode_set
+
+      # Footer status — mirrors the Remocon "Auto mode active 19.5°C Until …" line.
+      - type: markdown
+        content: |
+          **{{ states('sensor.elco_room_operation_mode_heating') }} mode active**
+
+          {{ states('sensor.elco_desired_room_temperature') }} °C —
+          {% if is_state('binary_sensor.elco_holiday_active', 'on') %}
+          Holiday until {{ as_timestamp(states('sensor.elco_holiday_until')) | timestamp_custom('%A %d/%m', true) }}
+          {% else %}
+          Schedule following weekly plan
+          {% endif %}
+
+  ##################################################################
+  # 3) Weekly schedule (Chauffage screen 2)
+  #    Markdown table that renders each day's slices "HH:MM→T°".
+  #    This is the no-HACS default; for the bar visual seen in the
+  #    Remocon screenshot, add an `apexcharts-card` (HACS) of your own
+  #    that reads the same `slices` attributes — see DASHBOARD.md.
+  ##################################################################
+  - type: markdown
+    title: Weekly schedule
+    content: |
+      {%- macro day_bar(suffix) -%}
+      {%- set s = state_attr('sensor.elco_schedule_' ~ suffix, 'slices') or [] -%}
+      {%- if s | count == 0 -%}—{%- else -%}
+      {%- for slot in s -%}
+      {{ slot.from_hhmm }}→{{ '%.1f' | format(slot.temp) }}°{% if not loop.last %} · {% endif %}
+      {%- endfor -%}
+      {%- endif -%}
+      {%- endmacro -%}
+      | Day | Slices |
+      |-----|--------|
+      | Mon | {{ day_bar('monday') }} |
+      | Tue | {{ day_bar('tuesday') }} |
+      | Wed | {{ day_bar('wednesday') }} |
+      | Thu | {{ day_bar('thursday') }} |
+      | Fri | {{ day_bar('friday') }} |
+      | Sat | {{ day_bar('saturday') }} |
+      | Sun | {{ day_bar('sunday') }} |
+
+  ##################################################################
+  # 4) Hot water card (Hot water screen)
+  ##################################################################
+  - type: entities
+    title: Hot water
+    state_color: true
+    entities:
+      - entity: sensor.elco_domestic_hot_water_storage_temperature
+        name: Current temperature
+        icon: mdi:thermometer-water
+      - entity: input_number.elco_dhw_comfort_temp_set
+        name: Target temperature
+        icon: mdi:water-thermometer
+      - entity: input_select.elco_dhw_mode_set
+        name: Mode
+        icon: mdi:water-boiler
+      - entity: binary_sensor.elco_domestic_hot_water_enabled
+        name: Enabled
+    footer:
+      type: graph
+      entity: sensor.elco_domestic_hot_water_storage_temperature
+      hours_to_show: 24
+      detail: 1
+
+  ##################################################################
+  # 5) Holiday card (Set holiday screen)
+  #
+  # To go on holiday: pick a return date in "Return date", then toggle
+  # "Holiday active" on. The AppDaemon listener pushes a SetData with
+  # the mutated zoneData.holidays array. Toggling off marks the active
+  # holiday deleted; the cloud removes it on the next save.
+  ##################################################################
+  - type: entities
+    title: Holiday
+    state_color: true
+    entities:
+      - entity: input_boolean.elco_holiday_active
+        name: Holiday active
+        icon: mdi:airplane
+      - entity: input_datetime.elco_holiday_until
+        name: Return date
+        icon: mdi:calendar-end
+      - type: conditional
+        conditions:
+          - entity: binary_sensor.elco_holiday_active
+            state: 'on'
+        row:
+          entity: sensor.elco_holiday_until
+          name: Boiler reports holiday until
+          icon: mdi:calendar-clock
+
+  ##################################################################
+  # 6) Plant detail (Boiler status)
+  ##################################################################
+  - type: entities
+    title: Boiler status
+    state_color: true
+    entities:
+      - entity: binary_sensor.elco_flame_sensor
+        name: Flame
+      - entity: binary_sensor.elco_heatpump_on
+        name: Heat pump
+      - entity: binary_sensor.elco_room_heating_is_active
+        name: Heating active
+      - entity: binary_sensor.elco_room_heating_is_request
+        name: Heating request pending
+      - entity: binary_sensor.elco_domestic_hot_water_enabled
+        name: DHW enabled
+      - entity: sensor.elco_room_operation_mode_heating
+        name: Operation mode
+      - type: section
+      - entity: binary_sensor.elco_outside_temperature_error
+        name: Outside probe error
+      - entity: binary_sensor.elco_domestic_hot_water_storage_temperature_error
+        name: DHW probe error
+      - entity: binary_sensor.elco_room_temperature_error
+        name: Room probe error
+    footer:
+      type: graph
+      entity: sensor.elco_room_temperature
+      hours_to_show: 48
+      detail: 2

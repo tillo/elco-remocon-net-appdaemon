@@ -189,6 +189,39 @@ key | optional | type | default | description
 | binary_sensor.elco_room_heating_is_request | Elco Room Heating or Cool is Request | zoneData.heatOrCoolRequest |  |
 | binary_sensor.elco_room_cooling_is_active | Elco Room Cooling is Active | zoneData.isCoolingActive |  |
 | binary_sensor.elco_room_temperature_error | Elco Room Temperature Error | zoneData.roomTempError |  |
+| binary_sensor.elco_holiday_active | Elco Holiday Active | zoneData.holidays |  |
+| sensor.elco_holiday_until | Elco Holiday Return Date | zoneData.holidays[].toAsIso | device_class: timestamp |
+| sensor.elco_schedule_{monday..sunday} | Per-weekday schedule slices | timeProgs[0].weeklyPlan | state = slice count, `slices` attribute carries `{from_min, from_hhmm, temp}` |
+
+## Remocon-NET-style dashboard
+
+A paste-ready Lovelace YAML mirroring the Remocon-NET mobile screens (chauffage
+view with circular gauge + mode buttons, weekly schedule bars, hot-water card,
+holiday card) lives at [`lovelace/remocon-net.yaml`](./lovelace/remocon-net.yaml).
+
+Required HA helpers (created by `elco_holiday_*` / `elco_*_set` in your
+`configuration.yaml`):
+
+```yaml
+input_boolean:
+  elco_holiday_active:
+    name: ELCO Holiday active
+    icon: mdi:airplane
+input_datetime:
+  elco_holiday_until:
+    name: ELCO Holiday return date
+    icon: mdi:calendar-end
+    has_date: true
+    has_time: false
+```
+
+The schedule card uses `custom:apexcharts-card` (HACS); a `markdown` fallback
+is included in the same file for users without the dependency.
+
+> Note: the BSB cloud API does **not** expose boiler flow/return water
+> temperature for THISION S / Altron B class plants. The "boiler" temperature
+> available from this integration is the DHW storage tank
+> (`sensor.elco_domestic_hot_water_storage_temperature`).
 
 ## Home Assistant dashboard
 

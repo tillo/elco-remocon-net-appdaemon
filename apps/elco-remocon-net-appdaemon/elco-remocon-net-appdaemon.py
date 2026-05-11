@@ -1024,20 +1024,23 @@ class Remocon(hass.Hass):
             self.log(f"Promoting zone mode {ZONE_MODE_TO_TEXT.get(zone_mode)} → Automatic for holiday")
             zone_mode = ZONE_MODE_TO_INT["Automatic"]
 
-        # The dashboard JS's setHomeData() passes the FULL bsbZoneRepo.getByZone(...)
-        # object as zoneData. The cloud is fine with read-only fields being echoed
-        # as long as their values match its cache — a mismatch (e.g. after a prior
-        # corruption) triggers 599. A slim payload is silently dropped because the
-        # cloud expects the full envelope to authoritatively merge.
+        # Build the zoneData echo: start from last_full_zoneData, splice in
+        # our holiday + mode mutations, then drop fields the BSB controller
+        # rejects on this hardware.
         #
-        # So: mirror the JS exactly. Start from last_full_zoneData (fresh from
-        # the most recent GetData), splice in our holiday + mode mutations.
+        # On a heat-only plant (no cooling subsystem), coolComfortTemp /
+        # coolReducedTemp come back as min=max=value=step=0 in GetData.
+        # Echoing those zeros to SetData triggers a 599 "Bsb parameters
+        # read/write error" on params 2950542/2950544 — the cloud reads
+        # them as a write attempt on cooling registers that don't exist.
+        # Dropping them lets the holiday write through.
         full_zone = dict(self.last_full_zoneData)
         full_zone["holidays"] = holidays
         full_zone["mode"] = {**(full_zone.get("mode") or {}), "value": zone_mode}
-        # zone field needs to be at the top level too (the BsbZoneData class
-        # has it as a scalar; the JS sends it).
         full_zone.setdefault("zone", zone_cached["zone"])
+        for cool_field in ("coolComfortTemp", "coolReducedTemp",
+                           "coolHolidayTemp", "coolProtectionTemp"):
+            full_zone.pop(cool_field, None)
 
         payload = {
             "plantData": {

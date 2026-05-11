@@ -964,14 +964,25 @@ class Remocon(hass.Hass):
                     self.log(f"Holiday already set to {until_iso}; no-op")
                     return
                 current["toAsIso"] = until_iso
+                current["toAsEpoch"] = int(datetime.fromisoformat(until_iso).timestamp())
                 current["changed"] = True
             else:
-                now_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                now_dt = datetime.now().replace(microsecond=0)
+                until_dt = datetime.fromisoformat(until_iso)
+                # Full Holiday DTO per Scripts/R2/app.bundle.min.js `me()`:
+                # {index, fromAsEpoch, toAsEpoch, fromAsIso, toAsIso, added, deleted, changed, osv}.
+                # Sending the trimmed {index, fromAsIso, toAsIso, added} is silently dropped
+                # by the cloud (returns ok:true but holidays array stays empty on next read).
                 holidays.append({
                     "index": len(holidays),
-                    "fromAsIso": now_iso,
-                    "toAsIso": until_iso,
+                    "fromAsEpoch": int(now_dt.timestamp()),
+                    "toAsEpoch":   int(until_dt.timestamp()),
+                    "fromAsIso":   now_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "toAsIso":     until_iso,
                     "added": True,
+                    "deleted": False,
+                    "changed": False,
+                    "osv": False,
                 })
             reason = f"holiday set until {until_iso}"
         else:

@@ -33,11 +33,15 @@ HOLIDAY_DATE_ENTITY = "input_datetime.elco_holiday_until"
 HOLIDAY_ACTIVE_ENTITY = "input_boolean.elco_holiday_active"
 HOLIDAY_USE_REDUCED_ENTITY = "input_boolean.elco_holiday_use_reduced"
 
-# Schedule write — staged as a JSON blob in this input_text. When it changes
-# and parses cleanly, AppDaemon POSTs SetTimeProg. Wrapping it as a single
-# text field keeps the HA UI plumbing simple; richer editors can compose the
-# JSON via scripts or templating.
-SCHEDULE_JSON_ENTITY = "input_text.elco_weekly_plan_json"
+# Schedule write — triggered by an HA event with the full weeklyPlan in data.
+# Using an event (vs. an input_text) avoids HA's 255-char limit on text helpers
+# and lets large/complex plans round-trip without truncation.
+#
+# Example HA service call:
+#   service: hassio.send_command            # any event-firing transport works
+# or via REST API:
+#   POST /api/events/elco_set_weekly_plan {"plans": [...], "ext": false, ...}
+SCHEDULE_EVENT = "elco_set_weekly_plan"
 
 # Weekday index → entity-id suffix. Remocon JS uses Date.getDay() (0=Sunday) for
 # the day field on schedule slices, so we mirror that.
@@ -85,8 +89,8 @@ class Remocon(hass.Hass):
             # Whether holiday drops to Reduced (off=false) or fully shuts CH (true).
             # Default in BSB controllers is false (boiler fully off during holiday).
             self.listen_state(self.on_holiday_use_reduced_changed, HOLIDAY_USE_REDUCED_ENTITY)
-            # Schedule JSON staging: on state change, parse and push to SetTimeProg.
-            self.listen_state(self.on_schedule_json_changed, SCHEDULE_JSON_ENTITY)
+            # Schedule write — listens for an HA event; payload is the full weeklyPlan.
+            self.listen_event(self.on_schedule_event, SCHEDULE_EVENT)
         else:
             self.log("Write controls disabled (set enable_writes: true in apps.yaml to enable)")
 
@@ -1095,26 +1099,22 @@ class Remocon(hass.Hass):
 
     # ----- SCHEDULE WRITE PATH -----
 
-    def on_schedule_json_changed(self, entity, attribute, old, new, kwargs):
+    def on_schedule_event(self, event_name, data, kwargs):
         """Pushes a new weekly plan to /R2/PlantTimeProgBsb/SetTimeProg/<gw>.
 
-        Expected `new` is a JSON string with shape:
+        Trigger: HA event `elco_set_weekly_plan` (POST /api/events/elco_set_weekly_plan
+        or service call with event payload). Event data shape:
             {"plans": [{"days": [<0..6>...], "slices": [{"from": <min>, "temp": <0|1>}, ...]}, ...]}
-        ext, maxSwitches etc. are merged from the cached weeklyPlan.
+        ext, maxSwitches, tick, baseTemp etc. are merged from the cached
+        weeklyPlan to preserve boiler-required fields.
 
-        Payload to cloud (mirrors the dashboard JS Re-constructor:
+        Cloud payload (mirrors the dashboard JS `Re` constructor):
             {progId, weeklyPlan, prevWeeklyPlan}
         """
-        if new in ("unavailable", "unknown", None, ""):
+        if not isinstance(data, dict) or not isinstance(data.get("plans"), list):
+            self.error(f"{event_name}: event data must be an object with a 'plans' list")
             return
-        try:
-            user_plan = json.loads(new)
-        except (ValueError, TypeError) as e:
-            self.error(f"{entity}: invalid JSON ({e}); ignoring write")
-            return
-        if not isinstance(user_plan, dict) or not isinstance(user_plan.get("plans"), list):
-            self.error(f"{entity}: JSON must be an object with a 'plans' list")
-            return
+        user_plan = data
 
         gateway = self.args.get("gateway_id")
         if not gateway:
@@ -1124,11 +1124,7 @@ class Remocon(hass.Hass):
 
         # Fold the user's plans into the previously-cached weeklyPlan so we
         # preserve ext/maxSwitches/tick/baseTemp etc. that the boiler expects.
-        prev = None
-        if self.last_full_zoneData:
-            # zoneData itself doesn't carry weeklyPlan; but the most recent
-            # GetData (when progIds=[zone]) put it in data.timeProgs[0]. Cache it.
-            prev = getattr(self, "last_weekly_plan", None)
+        prev = getattr(self, "last_weekly_plan", None)
 
         merged = dict(prev) if isinstance(prev, dict) else {}
         merged["plans"] = user_plan["plans"]
@@ -1142,7 +1138,7 @@ class Remocon(hass.Hass):
             "prevWeeklyPlan": prev,
         }
         url = urljoin(self._base_url(), posixpath.join("R2/PlantTimeProgBsb/SetTimeProg", gateway))
-        self.log(f"SetTimeProg ({entity} change): plans={len(merged.get('plans') or [])}")
+        self.log(f"SetTimeProg ({event_name}): plans={len(merged.get('plans') or [])}")
         try:
             session = self._login()
             response = session.post(url=url, json=payload)

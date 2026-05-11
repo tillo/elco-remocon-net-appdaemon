@@ -283,10 +283,12 @@ POST `/R2/PlantTimeProgBsb/SetTimeProg/<gw>` accepts:
 `prevWeeklyPlan` is used by the cloud for conflict detection; the app caches
 the most recently fetched plan in `self.last_weekly_plan` for this purpose.
 
-The user-facing surface is a single staging entity, `input_text.elco_weekly_plan_json`:
-write a JSON document of the form
+The user-facing surface is the HA event `elco_set_weekly_plan`. Fire it with
+the full weeklyPlan as event data:
 
 ```
+POST https://home.mdapi.ch/api/events/elco_set_weekly_plan
+Authorization: Bearer <token>
 {
   "plans": [
     {"days": [<0..6>...], "slices": [{"from": <minutes>, "temp": 0 or 1}, ...]},
@@ -295,10 +297,20 @@ write a JSON document of the form
 }
 ```
 
-into it. The app parses, merges the user's `plans` array on top of the cached
-`weeklyPlan` (preserving `ext`, `maxSwitches`, `tick`, `baseTemp`, etc.), then
-POSTs SetTimeProg. Validation is minimal — a rejected payload comes back as
-`ok=false` from the cloud and is logged.
+Or from an HA automation/script:
+
+```yaml
+service: notify.notify        # or any service; the listener fires regardless
+event: elco_set_weekly_plan   # alternatively: use trigger.event_data passthrough
+```
+
+The app merges the user's `plans` on top of the cached `weeklyPlan` (preserving
+`ext`, `maxSwitches`, `tick`, `baseTemp`, etc.), then POSTs SetTimeProg.
+Validation is minimal — a rejected payload comes back as `ok=false` from the
+cloud and is logged.
+
+Events were chosen over an `input_text` helper because HA caps text-helper
+states at 255 chars and a real weekly plan exceeds that.
 
 Slice temperature is the BSB **flag** (0 = reduced, 1 = comfort), not the
 actual °C. To change the °C, write through the existing `input_number.elco_ch_comfort_temp_set`

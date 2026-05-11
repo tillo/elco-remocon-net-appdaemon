@@ -243,9 +243,62 @@ Failure-mode rogue's gallery (kept here for posterity):
 Cache-corruption side effect: a sequence of failed SetData attempts
 can poison the cloud's cache for `chComfortTemp` / `chReducedTemp`,
 leaving them at `value=4.0` with inverted `min/max=10/4` sentinels.
-Recovery is manual: open Remocon-NET → Chauffage → Scheduling → set
-comfort to 19.5 (apply) → set reduced to 16.5 (apply). The cloud
-refreshes from the boiler and the cache returns to normal.
+
+The clean recovery is the **`PlantMenuBsb/WriteDataPoints/<gw>`**
+endpoint, which writes BSB datapoints by address directly. From a
+captured browser request:
+
+```
+POST /R2/PlantMenuBsb/WriteDataPoints/<gw>
+Content-Type: application/json
+[
+  {"address": 2950542, "newValueAsNumber": 19.5, "oldValueAsNumber": 4,
+   "newValueAsString": null, "oldValueAsString": null,
+   "newOsv": false, "oldOsv": false},
+  {"address": 2950544, "newValueAsNumber": 16.5, "oldValueAsNumber": 4,
+   "newValueAsString": null, "oldValueAsString": null,
+   "newOsv": false, "oldOsv": false}
+]
+```
+
+`2950542` = chComfortTemp BSB address, `2950544` = chReducedTemp BSB
+address (these are the same IDs that showed up in the 599 errors when
+SetData tried to write them indirectly). The endpoint is a granular
+backdoor for any BSB param the menu UI exposes; it does not go through
+the home/zone composite envelope and therefore avoids the corruption
+trap entirely. Equivalent recovery via Remocon mobile app: Chauffage →
+Scheduling → set comfort 19.5 (apply) → set reduced 16.5 (apply).
+
+### Holiday persistence — open: cloud silently drops
+
+Even with the browser-matched payload shape (viewModel.holidays +
+`__type__` discriminators + full plantData / zoneData echo + the
+XMLHttpRequest / Ajax-Request headers), the cloud returns `ok=true`
+with the `data` block reflecting **the unchanged state**: it parses
+the request, runs setHomeData, and serializes the result with
+`zoneData.holidays: []`. Three variants tested back-to-back:
+
+1. Holiday only in `viewModel.holidays` → no persist
+2. Holiday only in `zoneData.holidays` → no persist
+3. Holiday in BOTH locations → no persist
+
+Hypotheses for why the browser sent the same shape but our reasoning
+implies the browser save also didn't take effect (this needs to be
+confirmed via the Remocon UI showing "Holiday until X" after a save):
+
+- The boiler firmware blocks cloud-side holiday writes; only the wall
+  controller (or possibly the mobile app via a different API surface)
+  can set them.
+- Per-gateway feature flag (BsbPlantFeature) doesn't include holidays
+  for this hardware.
+- A SaveHoliday side-call is missing — the browser flow may issue an
+  extra request alongside SetData that we don't see in the captured
+  trace.
+
+Until those are resolved, the holiday write path is **silently
+non-functional** — HA helpers can reflect intent but the boiler
+doesn't honor it. Workaround: set holidays via the Remocon mobile app
+(if THAT works) or accept that the feature isn't available via cloud.
 
 ## Weekly schedule (read-only for now)
 

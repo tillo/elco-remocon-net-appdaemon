@@ -195,6 +195,40 @@ Read path: `sensor.elco_holiday_until` carries the active return date
 (`toAsIso`) as a `device_class: timestamp` state, `binary_sensor.elco_holiday_active`
 mirrors whether any non-deleted holiday exists.
 
+### KNOWN BLOCKER: holiday SetData is rejected by the cloud
+
+Every variant we have tried — slim payload, full echo, full echo minus
+cool* fields, full echo minus cool* + ch* fields, with or without
+gatewayId in zoneData, with the full 9-field Holiday DTO from the JS
+bundle — either:
+
+- Returns HTTP **200 ok=true** but the holiday array stays empty on the
+  next GetData (slim payloads), OR
+- Returns HTTP **599 "Bsb parameters read/write error from GW <gw>:
+  2950542, 2950544 (FailureId: 161020113036)"** for any payload that
+  echoes the full zoneData (fuller payloads).
+
+The two offending BSB parameter IDs (2950542, 2950544) appear stable
+across attempts and are NOT present as literals in `app.bundle.min.js`.
+They are not `chComfortTemp` / `chReducedTemp` (the most obvious
+suspects) — stripping those still produces the same 599.
+
+Side effect: a sequence of failed full-echo attempts can poison the
+cloud-side cache for `chComfortTemp` / `chReducedTemp`, leaving them
+at `value=4.0` with inverted `min/max=10/4` sentinels. Recovery is
+manual: open the Remocon-NET phone app → Chauffage → Scheduling → set
+comfort to 19.5 (apply) → set reduced to 16.5 (apply). The cloud
+refreshes from the boiler and the cache returns to normal.
+
+Until the right payload shape is identified, **the holiday write path
+is effectively unusable** — the HA helpers reflect intent but the
+boiler is not notified. Workaround: set holidays directly via the
+Remocon mobile app.
+
+Definitive next step would be to capture a real Remocon web browser
+session (DevTools → Network → record a save) and byte-diff against
+what we send. Anything short of that is guesswork.
+
 ## Weekly schedule (read-only for now)
 
 The Remocon "Chauffage" schedule view comes back inside the existing

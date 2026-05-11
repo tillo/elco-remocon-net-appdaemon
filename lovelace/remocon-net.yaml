@@ -271,7 +271,21 @@ cards:
           with **`Vacanze`**, **`Vacanza`**, **`Vacation`**, **`Vacances`**,
           **`Vacaciones`** or **`Holiday`** (case-insensitive). Rename trips
           to include the prefix to enrol them.
+
+          _Last refreshed: {{ as_timestamp(states.sensor.elco_upcoming_holidays.last_updated) | timestamp_custom('%a %d %b %H:%M') }}._
+          Auto-refreshes every 15 min and on Google Calendar state changes;
+          tap below to force a refresh after editing the calendar.
           {% endif %}
+      - type: conditional
+        conditions:
+          - entity: binary_sensor.elco_holiday_active
+            state: 'off'
+        card:
+          type: entities
+          entities:
+            - entity: input_button.elco_holidays_refresh
+              name: Refresh upcoming holidays
+              icon: mdi:calendar-refresh
       - type: entities
         state_color: true
         entities:

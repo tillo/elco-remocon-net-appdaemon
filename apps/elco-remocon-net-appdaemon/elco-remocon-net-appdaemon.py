@@ -1026,21 +1026,26 @@ class Remocon(hass.Hass):
 
         # Build the zoneData echo: start from last_full_zoneData, splice in
         # our holiday + mode mutations, then drop fields the BSB controller
-        # rejects on this hardware.
+        # rejects on this hardware:
         #
-        # On a heat-only plant (no cooling subsystem), coolComfortTemp /
-        # coolReducedTemp come back as min=max=value=step=0 in GetData.
-        # Echoing those zeros to SetData triggers a 599 "Bsb parameters
-        # read/write error" on params 2950542/2950544 — the cloud reads
-        # them as a write attempt on cooling registers that don't exist.
-        # Dropping them lets the holiday write through.
+        # - Cool* fields are zero-valued on a heat-only plant; echoing zeros
+        #   triggers a 599 "Bsb read/write error" on cooling registers that
+        #   don't exist.
+        # - chComfortTemp / chReducedTemp are documented as non-writable via
+        #   SetData (per WRITES.md — they go through PlantTimeProgBsb/
+        #   SetTemperature instead). Echoing them back is risky too — when
+        #   the cloud cache reports inverted-sentinel corruption (value=4.0
+        #   with min/max=10/4), the echo triggers another 599 and re-applies
+        #   the sentinel. Safer to omit and let the cloud merge by primary
+        #   key on the fields we DO send.
         full_zone = dict(self.last_full_zoneData)
         full_zone["holidays"] = holidays
         full_zone["mode"] = {**(full_zone.get("mode") or {}), "value": zone_mode}
         full_zone.setdefault("zone", zone_cached["zone"])
-        for cool_field in ("coolComfortTemp", "coolReducedTemp",
-                           "coolHolidayTemp", "coolProtectionTemp"):
-            full_zone.pop(cool_field, None)
+        for dropped in ("coolComfortTemp", "coolReducedTemp",
+                        "coolHolidayTemp", "coolProtectionTemp",
+                        "chComfortTemp", "chReducedTemp"):
+            full_zone.pop(dropped, None)
 
         payload = {
             "plantData": {

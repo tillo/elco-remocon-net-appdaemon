@@ -964,24 +964,23 @@ class Remocon(hass.Hass):
                     self.log(f"Holiday already set to {until_iso}; no-op")
                     return
                 current["toAsIso"] = until_iso
-                current["toAsEpoch"] = int(datetime.fromisoformat(until_iso).timestamp())
                 current["changed"] = True
             else:
-                now_dt = datetime.now().replace(microsecond=0)
-                until_dt = datetime.fromisoformat(until_iso)
-                # Full Holiday DTO per Scripts/R2/app.bundle.min.js `me()`:
-                # {index, fromAsEpoch, toAsEpoch, fromAsIso, toAsIso, added, deleted, changed, osv}.
-                # Sending the trimmed {index, fromAsIso, toAsIso, added} is silently dropped
-                # by the cloud (returns ok:true but holidays array stays empty on next read).
+                now_iso = datetime.now().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+                # Holiday DTO shape per a captured browser SetData request to
+                # /R2/PlantHomeBsb/SetData/<gw>. Notable detail: fromAsEpoch /
+                # toAsEpoch are sent as ZERO, NOT actual unix-seconds. The JS
+                # me() constructor declares them but the JS set() method never
+                # populates them. Cloud expects matching shape.
                 holidays.append({
                     "index": len(holidays),
-                    "fromAsEpoch": int(now_dt.timestamp()),
-                    "toAsEpoch":   int(until_dt.timestamp()),
-                    "fromAsIso":   now_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "fromAsEpoch": 0,
+                    "toAsEpoch":   0,
+                    "fromAsIso":   now_iso,
                     "toAsIso":     until_iso,
                     "added": True,
                     "deleted": False,
-                    "changed": False,
+                    "changed": True,
                     "osv": False,
                 })
             reason = f"holiday set until {until_iso}"
@@ -995,66 +994,84 @@ class Remocon(hass.Hass):
         self._post_holiday_setdata(holidays, reason=reason)
 
     def _post_holiday_setdata(self, holidays, reason):
-        """POST PlantHomeBsb/SetData with the modified holidays array.
+        """POST PlantHomeBsb/SetData with the new/cleared holiday.
 
-        The cloud's setHomeData (Scripts/R2/app.bundle.min.js) builds
-        `{plantData, zoneData, viewModel}` from the full BsbZoneData snapshot,
-        not a slim subset. For mode-only / DHW-temp writes a slim payload
-        works, but holiday writes are silently dropped (ok:true, holidays:[])
-        unless the full zoneData echo is sent. So we splice the modified
-        holidays into the cached full snapshot before posting.
+        Payload shape recovered from a captured browser request — significantly
+        different from what other SetData writes (DHW/mode) need:
+
+        1. The mutated holiday array goes in `viewModel.holidays`, NOT
+           `zoneData.holidays`. Putting it in zoneData makes the cloud
+           silently accept (ok=true) and drop it on the next refresh.
+        2. `viewModel` is a rich object — holidays + zone-state booleans +
+           scalar setpoints — not the slim `{zoneNumber}` we use elsewhere.
+        3. Both plantData and zoneData must carry a `__type__` discriminator
+           and a client-side `__lastUpdatedOn__` ISO timestamp. The cloud's
+           ASP.NET serializer uses __type__ to route to BsbPlantData /
+           BsbZoneData; without it the body is parsed as a generic dict and
+           the holiday mutation is dropped.
+        4. plantData and zoneData are echoed FULL (every field as fetched).
+           zoneData.holidays stays at [] (the cached state); the cloud merges
+           the viewModel mutations on top.
         """
         gateway = self.args.get("gateway_id")
         if not gateway:
             self.error("Cannot write holiday: gateway_id not configured")
             return
-        if not self.last_writable or not self.last_full_zoneData:
+        if not (self.last_writable and self.last_full_zoneData and self.last_full_plantData):
             self.error("Cannot write holiday: no GetData snapshot cached yet")
             return
 
         plant = self.last_writable["plantData"]
         zone_cached = self.last_writable["zoneData"]
         # When a holiday is active the BSB controller forces the zone into Auto;
-        # without that the Remocon UI itself rejects the save (and so does the
-        # cloud-side state machine). Pin the current mode unless it would
-        # contradict the active flag, in which case promote to Automatic.
+        # without that the cloud-side state machine rejects the save.
         zone_mode = int(zone_cached["mode"]["value"])
         any_active = any(not (h or {}).get("deleted") for h in (holidays or []))
         if any_active and zone_mode != ZONE_MODE_TO_INT["Automatic"]:
             self.log(f"Promoting zone mode {ZONE_MODE_TO_TEXT.get(zone_mode)} → Automatic for holiday")
             zone_mode = ZONE_MODE_TO_INT["Automatic"]
 
-        # Build the zoneData echo: start from last_full_zoneData, splice in
-        # our holiday + mode mutations, then drop fields the BSB controller
-        # rejects on this hardware:
-        #
-        # - Cool* fields are zero-valued on a heat-only plant; echoing zeros
-        #   triggers a 599 "Bsb read/write error" on cooling registers that
-        #   don't exist.
-        # - chComfortTemp / chReducedTemp are documented as non-writable via
-        #   SetData (per WRITES.md — they go through PlantTimeProgBsb/
-        #   SetTemperature instead). Echoing them back is risky too — when
-        #   the cloud cache reports inverted-sentinel corruption (value=4.0
-        #   with min/max=10/4), the echo triggers another 599 and re-applies
-        #   the sentinel. Safer to omit and let the cloud merge by primary
-        #   key on the fields we DO send.
-        full_zone = dict(self.last_full_zoneData)
-        full_zone["holidays"] = holidays
-        full_zone["mode"] = {**(full_zone.get("mode") or {}), "value": zone_mode}
-        full_zone.setdefault("zone", zone_cached["zone"])
-        for dropped in ("coolComfortTemp", "coolReducedTemp",
-                        "coolHolidayTemp", "coolProtectionTemp",
-                        "chComfortTemp", "chReducedTemp"):
-            full_zone.pop(dropped, None)
+        now_iso = datetime.now().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+
+        # --- viewModel: holidays mutation + current zone-state echo ---
+        zd = self.last_full_zoneData
+        pd = self.last_full_plantData
+        view_model = {
+            "holidays": holidays,
+            "outsideTemp": f"{pd.get('outsideTemp', 0)} °C",  # "16.8 °C"
+            "zoneNumber": zone_cached["zone"],
+            "zoneMode": zone_mode,
+            "isZoneOff":     zone_mode == ZONE_MODE_TO_INT["Protection"],
+            "isZoneAuto":    zone_mode == ZONE_MODE_TO_INT["Automatic"],
+            "isZoneReduced": zone_mode == ZONE_MODE_TO_INT["Reduced"],
+            "isZoneComfort": zone_mode == ZONE_MODE_TO_INT["Comfort"],
+            "chComfortTemp": (zd.get("chComfortTemp") or {}).get("value", 0),
+            "chReducedTemp": (zd.get("chReducedTemp") or {}).get("value", 0),
+            "coolComfortTemp": (zd.get("coolComfortTemp") or {}).get("value", 0),
+            "coolReducedTemp": (zd.get("coolReducedTemp") or {}).get("value", 0),
+            "desiredTemp":   zd.get("desiredRoomTemp", 0),
+            "antiFreezeTemp": zd.get("chProtectionTemp", 10),
+        }
+
+        # --- plantData: full echo + __type__ + __lastUpdatedOn__ + gatewayId ---
+        plant_echo = dict(pd)
+        plant_echo["__type__"] = ["my.entities.entityiface", "my.entities.bsbplantdata"]
+        plant_echo["__lastUpdatedOn__"] = now_iso
+        plant_echo["gatewayId"] = gateway
+
+        # --- zoneData: full echo + metadata. holidays stays at the cached [] ---
+        zone_echo = dict(zd)
+        zone_echo["__type__"] = ["my.entities.entityiface", "my.entities.bsbzonedata"]
+        zone_echo["__lastUpdatedOn__"] = now_iso
+        zone_echo["gatewayId"] = gateway
+        zone_echo["zone"] = zone_cached["zone"]
+        # Apply mode promotion so the echo reflects the new target state.
+        zone_echo["mode"] = {**(zd.get("mode") or {}), "value": zone_mode}
 
         payload = {
-            "plantData": {
-                "dhwComfortTemp": {"value": plant["dhwComfortTemp"]["value"]},
-                "dhwReducedTemp": {"value": plant["dhwReducedTemp"]["value"]},
-                "dhwMode":        {"value": plant["dhwMode"]["value"]},
-            },
-            "zoneData": full_zone,
-            "viewModel": {"zoneNumber": zone_cached["zone"]},
+            "viewModel": view_model,
+            "plantData": plant_echo,
+            "zoneData":  zone_echo,
         }
         url = urljoin(self._base_url(), posixpath.join("R2/PlantHomeBsb/SetData", gateway))
         self.log(f"SetData (holiday: {reason}): payload={json.dumps(payload)}")

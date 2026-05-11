@@ -195,39 +195,57 @@ Read path: `sensor.elco_holiday_until` carries the active return date
 (`toAsIso`) as a `device_class: timestamp` state, `binary_sensor.elco_holiday_active`
 mirrors whether any non-deleted holiday exists.
 
-### KNOWN BLOCKER: holiday SetData is rejected by the cloud
+### Working payload shape
 
-Every variant we have tried — slim payload, full echo, full echo minus
-cool* fields, full echo minus cool* + ch* fields, with or without
-gatewayId in zoneData, with the full 9-field Holiday DTO from the JS
-bundle — either:
+Recovered from a captured browser SetData request. The shape is
+substantially different from the other writes; getting it wrong leads
+to either `ok=true` with a silently-dropped holiday OR HTTP 599
+"Bsb parameters read/write error":
 
-- Returns HTTP **200 ok=true** but the holiday array stays empty on the
-  next GetData (slim payloads), OR
-- Returns HTTP **599 "Bsb parameters read/write error from GW <gw>:
-  2950542, 2950544 (FailureId: 161020113036)"** for any payload that
-  echoes the full zoneData (fuller payloads).
+1. **Holiday mutations go in `viewModel.holidays`**, NOT
+   `zoneData.holidays`. The latter stays at `[]` (cached state).
+2. `viewModel` is a rich object with the zone-state echo:
+   ```
+   { holidays: [...], outsideTemp: "X °C", zoneNumber, zoneMode,
+     isZoneOff, isZoneAuto, isZoneReduced, isZoneComfort,
+     chComfortTemp, chReducedTemp,         <- scalars, not objects
+     coolComfortTemp, coolReducedTemp,
+     desiredTemp, antiFreezeTemp }
+   ```
+3. Both `plantData` and `zoneData` need a `__type__` discriminator
+   (`["my.entities.entityiface","my.entities.bsbplantdata"]` /
+   `bsbzonedata`) and a `__lastUpdatedOn__` ISO timestamp. Without
+   these the cloud's ASP.NET serializer parses the body as a generic
+   dict and the holiday mutation gets dropped.
+4. plantData and zoneData carry every field from the last GetData
+   response (full echo), including the cooling fields with their
+   zero values on a heat-only plant. The cloud only validates the
+   metadata wrapper, not the inner BSB params, once `__type__` is
+   present.
 
-The two offending BSB parameter IDs (2950542, 2950544) appear stable
-across attempts and are NOT present as literals in `app.bundle.min.js`.
-They are not `chComfortTemp` / `chReducedTemp` (the most obvious
-suspects) — stripping those still produces the same 599.
+Holiday DTO oddity (also in the captured payload):
+`fromAsEpoch: 0, toAsEpoch: 0` — zeros, not actual unix seconds. The
+JS `me()` constructor declares them but the JS `set()` method never
+populates them. Sending real epochs is harmless but unnecessary;
+zeros match the JS exactly.
 
-Side effect: a sequence of failed full-echo attempts can poison the
-cloud-side cache for `chComfortTemp` / `chReducedTemp`, leaving them
-at `value=4.0` with inverted `min/max=10/4` sentinels. Recovery is
-manual: open the Remocon-NET phone app → Chauffage → Scheduling → set
+Failure-mode rogue's gallery (kept here for posterity):
+
+- Slim `{zone, mode, holidays}` payload → `ok=true`, dropped.
+- Full zoneData echo with holidays in zoneData → `ok=true`, dropped.
+- Full zoneData echo with `__type__` but holidays still in zoneData →
+  `ok=true`, dropped.
+- Full echo without `__type__` → HTTP 599 on params `2950542, 2950544`.
+- Echo with `coolComfortTemp/coolReducedTemp` (zeros) but no
+  `__type__` → same 599. Those param IDs are red herrings of the
+  type-routing failure path, not specific BSB datapoints.
+
+Cache-corruption side effect: a sequence of failed SetData attempts
+can poison the cloud's cache for `chComfortTemp` / `chReducedTemp`,
+leaving them at `value=4.0` with inverted `min/max=10/4` sentinels.
+Recovery is manual: open Remocon-NET → Chauffage → Scheduling → set
 comfort to 19.5 (apply) → set reduced to 16.5 (apply). The cloud
 refreshes from the boiler and the cache returns to normal.
-
-Until the right payload shape is identified, **the holiday write path
-is effectively unusable** — the HA helpers reflect intent but the
-boiler is not notified. Workaround: set holidays directly via the
-Remocon mobile app.
-
-Definitive next step would be to capture a real Remocon web browser
-session (DevTools → Network → record a save) and byte-diff against
-what we send. Anything short of that is guesswork.
 
 ## Weekly schedule (read-only for now)
 

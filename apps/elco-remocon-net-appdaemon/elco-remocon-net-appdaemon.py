@@ -1024,14 +1024,23 @@ class Remocon(hass.Hass):
             self.log(f"Promoting zone mode {ZONE_MODE_TO_TEXT.get(zone_mode)} → Automatic for holiday")
             zone_mode = ZONE_MODE_TO_INT["Automatic"]
 
-        # Build zoneData = full cached snapshot, but with our modifications
-        # applied: mode (possibly promoted) and the new holidays array.
-        full_zone = dict(self.last_full_zoneData)
-        full_zone["holidays"] = holidays
-        # mode is itself an object {value, options, ...}; only the .value moves.
-        mode_obj = dict(full_zone.get("mode") or {})
-        mode_obj["value"] = zone_mode
-        full_zone["mode"] = mode_obj
+        # Build zoneData: the full echo gets a 599 (read-only BSB params like
+        # chComfortTemp/chReducedTemp can't go via SetData), but the slim
+        # {zone, mode, holidays} echo is silently dropped. The set that works
+        # is: holiday-adjacent fields only (the holiday DTO array + the
+        # holiday-behaviour scalars + the holiday-temp fields), plus the
+        # writable zone scalars (mode + useReducedOperationModeOnHoliday).
+        # Everything else (room temp, heating-active flags, CH temps, etc.)
+        # is read-only state and must be omitted.
+        src = self.last_full_zoneData
+        full_zone = {
+            "zone": zone_cached["zone"],
+            "mode": {**(src.get("mode") or {}), "value": zone_mode},
+            "useReducedOperationModeOnHoliday": bool(src.get("useReducedOperationModeOnHoliday", False)),
+            "chHolidayTemp": src.get("chHolidayTemp", 0.0),
+            "coolHolidayTemp": src.get("coolHolidayTemp", 0.0),
+            "holidays": holidays,
+        }
 
         payload = {
             "plantData": {

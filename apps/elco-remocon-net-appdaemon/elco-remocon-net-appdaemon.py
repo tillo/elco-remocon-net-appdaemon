@@ -953,9 +953,15 @@ class Remocon(hass.Hass):
                 return
             until_iso = d.strftime("%Y-%m-%dT%H:%M:%S")
 
-        # Build the mutated holidays array from the cached snapshot.
+        # Build the mutated holidays array from the cached snapshot — DEEP-copy
+        # the existing entries so the upstream `self.last_full_zoneData` is not
+        # touched. The cloud diffs `viewModel.holidays` (new state) against
+        # `zoneData.holidays` (current state) to compute the write; if we
+        # mutate the same dicts referenced by zoneData, both sides end up
+        # equal and the cloud sees no change → silently dropped.
+        import copy as _copy
         zone_data = self.last_full_zoneData
-        holidays = list(zone_data.get("holidays") or [])
+        holidays = [_copy.deepcopy(h) for h in (zone_data.get("holidays") or [])]
         current = next((h for h in holidays if not (h or {}).get("deleted")), None)
 
         # Persistent holiday shape from the cloud is date-only, no time and no

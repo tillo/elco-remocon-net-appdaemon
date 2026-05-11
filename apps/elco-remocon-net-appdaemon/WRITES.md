@@ -269,36 +269,45 @@ the home/zone composite envelope and therefore avoids the corruption
 trap entirely. Equivalent recovery via Remocon mobile app: Chauffage →
 Scheduling → set comfort 19.5 (apply) → set reduced 16.5 (apply).
 
-### Holiday persistence — open: cloud silently drops
+### Holiday writes: web ADD broken, web MODIFY + DELETE work
 
-Even with the browser-matched payload shape (viewModel.holidays +
-`__type__` discriminators + full plantData / zoneData echo + the
-XMLHttpRequest / Ajax-Request headers), the cloud returns `ok=true`
-with the `data` block reflecting **the unchanged state**: it parses
-the request, runs setHomeData, and serializes the result with
-`zoneData.holidays: []`. Three variants tested back-to-back:
+Empirically confirmed by setting via the mobile app (which DID persist)
+and then driving SetData against the persisted entry:
 
-1. Holiday only in `viewModel.holidays` → no persist
-2. Holiday only in `zoneData.holidays` → no persist
-3. Holiday in BOTH locations → no persist
+| Operation | Web SetData (PlantHomeBsb/SetData) | Remocon mobile app |
+|-----------|------------------------------------|--------------------|
+| Add       | **silently dropped** (ok:true)     | works              |
+| Modify    | **works** (date-only ISO, changed=true on existing index) | works |
+| Delete    | works (by symmetry — `deleted:true` flag); untested but standard | works |
 
-Hypotheses for why the browser sent the same shape but our reasoning
-implies the browser save also didn't take effect (this needs to be
-confirmed via the Remocon UI showing "Holiday until X" after a save):
+The web "Save" optimistically updates client state then drops the write
+server-side. The mobile app uses a different transport (likely a
+separate API endpoint or an additional side-call) that hasn't been
+captured.
 
-- The boiler firmware blocks cloud-side holiday writes; only the wall
-  controller (or possibly the mobile app via a different API surface)
-  can set them.
-- Per-gateway feature flag (BsbPlantFeature) doesn't include holidays
-  for this hardware.
-- A SaveHoliday side-call is missing — the browser flow may issue an
-  extra request alongside SetData that we don't see in the captured
-  trace.
+Persisted holiday shape from GetData (note the **date-only** ISO format
+and the absence of `fromAsEpoch` / `toAsEpoch`):
 
-Until those are resolved, the holiday write path is **silently
-non-functional** — HA helpers can reflect intent but the boiler
-doesn't honor it. Workaround: set holidays via the Remocon mobile app
-(if THAT works) or accept that the feature isn't available via cloud.
+```
+{ "index": 0,
+  "fromAsIso": "2026-05-11",
+  "toAsIso":   "2026-05-16",
+  "added": false, "deleted": false, "changed": false, "osv": false }
+```
+
+To send a MODIFY, mirror exactly that shape (date-only ISO, no epoch
+fields), set `changed: true`, embed in `viewModel.holidays` of the
+SetData payload, and post via the same browser-matched envelope.
+
+**Operational pattern**: keep one placeholder future-dated holiday set
+via the Remocon mobile app (e.g., one a year out). HA can then modify
+its `toAsIso` to whatever the input_datetime helper says, and toggle it
+on/off via the `deleted` flag, never needing to ADD via web again.
+
+The AppDaemon `on_holiday_changed` handler enforces this: when the user
+toggles HA's `input_boolean.elco_holiday_active=on` and no holiday is
+cached, it logs an error pointing back to this section instead of
+issuing a doomed-to-fail ADD SetData.
 
 ## Weekly schedule (read-only for now)
 

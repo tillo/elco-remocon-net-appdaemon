@@ -958,32 +958,33 @@ class Remocon(hass.Hass):
         holidays = list(zone_data.get("holidays") or [])
         current = next((h for h in holidays if not (h or {}).get("deleted")), None)
 
+        # Persistent holiday shape from the cloud is date-only, no time and no
+        # epoch fields. Match it.
+        until_date = until_iso.split("T")[0] if until_iso else None
+
         if want_active:
             if current is not None:
-                if current.get("toAsIso") == until_iso:
-                    self.log(f"Holiday already set to {until_iso}; no-op")
+                if current.get("toAsIso") == until_date:
+                    self.log(f"Holiday already set to {until_date}; no-op")
                     return
-                current["toAsIso"] = until_iso
+                # MODIFY existing holiday — this is the only ADD/MODIFY path
+                # that the web SetData endpoint actually persists. The cloud
+                # silently drops added=true on a fresh entry (see WRITES.md).
+                current["toAsIso"] = until_date
                 current["changed"] = True
+                reason = f"holiday end date → {until_date}"
             else:
-                now_iso = datetime.now().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
-                # Holiday DTO shape per a captured browser SetData request to
-                # /R2/PlantHomeBsb/SetData/<gw>. Notable detail: fromAsEpoch /
-                # toAsEpoch are sent as ZERO, NOT actual unix-seconds. The JS
-                # me() constructor declares them but the JS set() method never
-                # populates them. Cloud expects matching shape.
-                holidays.append({
-                    "index": len(holidays),
-                    "fromAsEpoch": 0,
-                    "toAsEpoch":   0,
-                    "fromAsIso":   now_iso,
-                    "toAsIso":     until_iso,
-                    "added": True,
-                    "deleted": False,
-                    "changed": True,
-                    "osv": False,
-                })
-            reason = f"holiday set until {until_iso}"
+                # ADD path: the web SetData drops these. The user has to seed
+                # an initial holiday via the Remocon mobile app first. Log a
+                # warning so the user sees a clear reason if their toggle
+                # doesn't take effect.
+                self.error(
+                    f"Cannot ADD holiday via cloud web SetData (known bug — see WRITES.md). "
+                    f"To set a holiday until {until_date}, FIRST seed any future-dated holiday "
+                    f"via the Remocon mobile app, then HA can modify it. "
+                    f"Keeping HA helper at on; boiler not notified."
+                )
+                return
         else:
             if current is None:
                 self.log("Holiday cleared but no active holiday — no-op")

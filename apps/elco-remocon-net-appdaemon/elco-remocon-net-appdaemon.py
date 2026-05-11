@@ -921,8 +921,8 @@ class Remocon(hass.Hass):
         """
         if new in ("unavailable", "unknown", None):
             return
-        if not self.last_full_zoneData:
-            self.error("Holiday change ignored — no zoneData snapshot cached yet")
+        if not self.last_writable:
+            self.error("Holiday change ignored — no GetData snapshot cached yet")
             return
 
         active_state = self.get_state(HOLIDAY_ACTIVE_ENTITY)
@@ -932,14 +932,11 @@ class Remocon(hass.Hass):
             return
 
         want_active = (active_state == "on")
-        until_iso = None
         if want_active:
             if date_state in ("unavailable", "unknown", None, ""):
                 self.log(f"Holiday set to active but {HOLIDAY_DATE_ENTITY}={date_state}; "
                          f"pick a return date to push the write")
                 return
-            # input_datetime with has_date:true, has_time:false yields "YYYY-MM-DD".
-            # The BSB cloud expects an ISO datetime (e.g. "2026-05-15T00:00:00").
             try:
                 d = datetime.strptime(date_state, "%Y-%m-%d")
             except ValueError:
@@ -948,163 +945,94 @@ class Remocon(hass.Hass):
                 except ValueError:
                     self.error(f"Cannot parse {HOLIDAY_DATE_ENTITY}={date_state}")
                     return
-            if d.date() <= datetime.now().date():
-                self.error(f"Holiday return date {d.date()} is not in the future; ignoring")
+            if d.date() < datetime.now().date():
+                self.error(f"Holiday return date {d.date()} is in the past; ignoring")
                 return
-            until_iso = d.strftime("%Y-%m-%dT%H:%M:%S")
-
-        # Build the mutated holidays array from the cached snapshot — DEEP-copy
-        # the existing entries so the upstream `self.last_full_zoneData` is not
-        # touched. The cloud diffs `viewModel.holidays` (new state) against
-        # `zoneData.holidays` (current state) to compute the write; if we
-        # mutate the same dicts referenced by zoneData, both sides end up
-        # equal and the cloud sees no change → silently dropped.
-        import copy as _copy
-        zone_data = self.last_full_zoneData
-        holidays = [_copy.deepcopy(h) for h in (zone_data.get("holidays") or [])]
-        current = next((h for h in holidays if not (h or {}).get("deleted")), None)
-
-        # Persistent holiday shape from the cloud is date-only, no time and no
-        # epoch fields. Match it.
-        until_date = until_iso.split("T")[0] if until_iso else None
-
-        if want_active:
-            if current is not None:
-                if current.get("toAsIso") == until_date:
-                    self.log(f"Holiday already set to {until_date}; no-op")
-                    return
-                # MODIFY existing holiday — this is the only ADD/MODIFY path
-                # that the web SetData endpoint actually persists. The cloud
-                # silently drops added=true on a fresh entry (see WRITES.md).
-                current["toAsIso"] = until_date
-                current["changed"] = True
-                reason = f"holiday end date → {until_date}"
-            else:
-                # ADD path: the web SetData drops these. The user has to seed
-                # an initial holiday via the Remocon mobile app first. Log a
-                # warning so the user sees a clear reason if their toggle
-                # doesn't take effect.
-                self.error(
-                    f"Cannot ADD holiday via cloud web SetData (known bug — see WRITES.md). "
-                    f"To set a holiday until {until_date}, FIRST seed any future-dated holiday "
-                    f"via the Remocon mobile app, then HA can modify it. "
-                    f"Keeping HA helper at on; boiler not notified."
-                )
-                return
+            until_iso = d.strftime("%Y-%m-%dT00:00")
         else:
-            if current is None:
-                self.log("Holiday cleared but no active holiday — no-op")
-                return
-            current["deleted"] = True
+            until_iso = None
+
+        # The /api/v2/remote/bsbHolidays endpoint always writes to a numbered
+        # slot. The mobile app uses slot 0; we mirror that. Slots 1..7 stay
+        # untouched.
+        if want_active:
+            today_iso = datetime.now().strftime("%Y-%m-%dT00:00")
+            new_holiday = {"index": 0, "from": today_iso, "to": until_iso}
+            reason = f"holiday set today → {until_iso[:10]}"
+        else:
+            # "Clear" = write the empty marker (zero-length on 1 Jan). Boiler
+            # ignores any holiday whose range is fully in the past.
+            new_holiday = {"index": 0, "from": "2026-01-01T00:00", "to": "2026-01-01T00:00"}
             reason = "holiday cleared"
 
-        self._post_holiday_setdata(holidays, reason=reason)
+        self._post_holiday_v2(new_holiday, reason=reason)
 
-    def _post_holiday_setdata(self, holidays, reason):
-        """POST PlantHomeBsb/SetData with the new/cleared holiday.
+    def _post_holiday_v2(self, new_holiday, reason):
+        """POST /api/v2/remote/bsbHolidays/<gw>/<zone> — the modern mobile-app
+        endpoint discovered by intercepting Remocon NET Android v6.0.7773.40339.
 
-        Payload shape recovered from a captured browser request — significantly
-        different from what other SetData writes (DHW/mode) need:
+        Body shape:
+            { "currentZoneMode": <int>,
+              "new":  {"index": 0..7, "from": "YYYY-MM-DDT00:00", "to": "YYYY-MM-DDT00:00"},
+              "old":  {"index": 0..7, "from": ..., "to": ..., "osv": true} }
 
-        1. The mutated holiday array goes in `viewModel.holidays`, NOT
-           `zoneData.holidays`. Putting it in zoneData makes the cloud
-           silently accept (ok=true) and drop it on the next refresh.
-        2. `viewModel` is a rich object — holidays + zone-state booleans +
-           scalar setpoints — not the slim `{zoneNumber}` we use elsewhere.
-        3. Both plantData and zoneData must carry a `__type__` discriminator
-           and a client-side `__lastUpdatedOn__` ISO timestamp. The cloud's
-           ASP.NET serializer uses __type__ to route to BsbPlantData /
-           BsbZoneData; without it the body is parsed as a generic dict and
-           the holiday mutation is dropped.
-        4. plantData and zoneData are echoed FULL (every field as fetched).
-           zoneData.holidays stays at [] (the cached state); the cloud merges
-           the viewModel mutations on top.
+        The boiler has a fixed array of 8 holiday slots (0..7). Slot 0 is the
+        one the mobile app uses; we mirror that. Slots not in use return
+        from=to=2026-01-01T00:00 (zero-length range that the boiler ignores).
+        ADD/MODIFY/DELETE are all the same operation — write the desired
+        (from, to) to the slot. To "clear" a slot, write the empty marker.
+
+        Auth: standard /R2/Account/Login session cookie works. No need for the
+        ar.authToken header the mobile app uses — the cookie-based auth on
+        legacy /R2 endpoints carries over to /api/v2.
         """
         gateway = self.args.get("gateway_id")
         if not gateway:
             self.error("Cannot write holiday: gateway_id not configured")
             return
-        if not (self.last_writable and self.last_full_zoneData and self.last_full_plantData):
-            self.error("Cannot write holiday: no GetData snapshot cached yet")
-            return
+        zone = self.args.get("zone") or 1
 
-        plant = self.last_writable["plantData"]
-        zone_cached = self.last_writable["zoneData"]
-        # When a holiday is active the BSB controller forces the zone into Auto;
-        # without that the cloud-side state machine rejects the save.
-        zone_mode = int(zone_cached["mode"]["value"])
-        any_active = any(not (h or {}).get("deleted") for h in (holidays or []))
-        if any_active and zone_mode != ZONE_MODE_TO_INT["Automatic"]:
-            self.log(f"Promoting zone mode {ZONE_MODE_TO_TEXT.get(zone_mode)} → Automatic for holiday")
-            zone_mode = ZONE_MODE_TO_INT["Automatic"]
+        url_base = self._base_url()
+        list_url = urljoin(url_base, f"api/v2/remote/bsbHolidays/{gateway}/{zone}")
+        post_url = list_url
+        headers = {"User-Agent": "ktor-client", "Accept": "application/json",
+                   "Content-Type": "application/json"}
 
-        now_iso = datetime.now().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
-
-        # --- viewModel: holidays mutation + current zone-state echo ---
-        zd = self.last_full_zoneData
-        pd = self.last_full_plantData
-        view_model = {
-            "holidays": holidays,
-            "outsideTemp": f"{pd.get('outsideTemp', 0)} °C",  # "16.8 °C"
-            "zoneNumber": zone_cached["zone"],
-            "zoneMode": zone_mode,
-            "isZoneOff":     zone_mode == ZONE_MODE_TO_INT["Protection"],
-            "isZoneAuto":    zone_mode == ZONE_MODE_TO_INT["Automatic"],
-            "isZoneReduced": zone_mode == ZONE_MODE_TO_INT["Reduced"],
-            "isZoneComfort": zone_mode == ZONE_MODE_TO_INT["Comfort"],
-            "chComfortTemp": (zd.get("chComfortTemp") or {}).get("value", 0),
-            "chReducedTemp": (zd.get("chReducedTemp") or {}).get("value", 0),
-            "coolComfortTemp": (zd.get("coolComfortTemp") or {}).get("value", 0),
-            "coolReducedTemp": (zd.get("coolReducedTemp") or {}).get("value", 0),
-            "desiredTemp":   zd.get("desiredRoomTemp", 0),
-            "antiFreezeTemp": zd.get("chProtectionTemp", 10),
-        }
-
-        # --- plantData: full echo + __type__ + __lastUpdatedOn__ + gatewayId ---
-        plant_echo = dict(pd)
-        plant_echo["__type__"] = ["my.entities.entityiface", "my.entities.bsbplantdata"]
-        plant_echo["__lastUpdatedOn__"] = now_iso
-        plant_echo["gatewayId"] = gateway
-
-        # --- zoneData: full echo + metadata. holidays stays at the cached [] ---
-        zone_echo = dict(zd)
-        zone_echo["__type__"] = ["my.entities.entityiface", "my.entities.bsbzonedata"]
-        zone_echo["__lastUpdatedOn__"] = now_iso
-        zone_echo["gatewayId"] = gateway
-        zone_echo["zone"] = zone_cached["zone"]
-        # Apply mode promotion so the echo reflects the new target state.
-        zone_echo["mode"] = {**(zd.get("mode") or {}), "value": zone_mode}
-
-        payload = {
-            "viewModel": view_model,
-            "plantData": plant_echo,
-            "zoneData":  zone_echo,
-        }
-        url = urljoin(self._base_url(), posixpath.join("R2/PlantHomeBsb/SetData", gateway))
-        self.log(f"SetData (holiday: {reason}): payload={json.dumps(payload)}")
-        # XMLHttpRequest + Ajax-Request headers match the browser capture; the
-        # cloud's ASP.NET pipeline appears to route holiday-bearing payloads
-        # differently when these are absent (the body parses fine — type
-        # discriminator works — but the viewModel.holidays mutation is dropped).
-        headers = {
-            "X-Requested-With": "XMLHttpRequest",
-            "Ajax-Request": "json",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-        }
         try:
             session = self._login()
-            response = session.post(url=url, json=payload, headers=headers)
-            if response.status_code != 200:
-                self.error(f"Holiday SetData HTTP {response.status_code}: {response.text[:300]}")
+            # Read the current slot state so we can include a faithful `old`
+            # for the cloud's optimistic-concurrency check.
+            r = session.get(list_url, headers=headers)
+            if r.status_code != 200:
+                self.error(f"GET bsbHolidays HTTP {r.status_code}: {r.text[:200]}")
                 return
-            result = json.loads(response.text)
-            if not result.get("ok"):
-                self.error(f"Holiday SetData rejected: {result.get('message')} (debug: {result.get('debugMessage')})")
+            slots = r.json()
+            if not isinstance(slots, list) or new_holiday["index"] >= len(slots):
+                self.error(f"Unexpected bsbHolidays response: {r.text[:200]}")
                 return
-            self.log(f"Holiday SetData ok ({reason})")
+            old = dict(slots[new_holiday["index"]])
+            old.setdefault("osv", True)
+
+            zone_mode = int(self.last_writable["zoneData"]["mode"]["value"]) \
+                        if self.last_writable else 1
+            body = {
+                "currentZoneMode": zone_mode,
+                "new": new_holiday,
+                "old": old,
+            }
+            self.log(f"Holiday v2 ({reason}): {json.dumps(body)}")
+            r = session.post(post_url, headers=headers, json=body)
+            if r.status_code != 200:
+                self.error(f"Holiday v2 HTTP {r.status_code}: {r.text[:300]}")
+                return
+            result = r.json()
+            if not result.get("success"):
+                self.error(f"Holiday v2 rejected: {r.text[:300]}")
+                return
+            self.log(f"Holiday v2 ok ({reason})")
             self.run_in(self.get_remocon_data, 5)
         except Exception as e:
-            self.error(f"Holiday SetData exception: {e}")
+            self.error(f"Holiday v2 exception: {e}")
 
     # ----- HOLIDAY-MODE-REDUCED FLAG -----
 

@@ -147,167 +147,80 @@ plant. Adjust if your hardware reports different limits.
 - If the gateway is offline, writes will succeed at the cloud layer but the
   boiler won't change until reconnect. The sensors will lag accordingly.
 
-## Holiday set/clear
+## Holiday set/clear (mobile API)
 
-The "Set holiday" feature in the Remocon-NET app maps to mutations of
-`zoneData.holidays` (an array on `BsbZoneData`) that are echoed back via the
-existing `PlantHomeBsb/SetData/<gw>` endpoint. There is no separate holiday
-endpoint — the cloud merges by `zone` + `index` on each save.
-
-Per-entry shape (source: `holidayModel` in `Scripts/R2/app.bundle.min.js`):
+The Remocon-NET *mobile* app uses a dedicated REST endpoint that the
+*web* UI doesn't:
 
 ```
-{ index: <int>, fromAsIso: "YYYY-MM-DDTHH:MM:SS", toAsIso: "YYYY-MM-DDTHH:MM:SS",
-  added: bool?, changed: bool?, deleted: bool? }
-```
-
-Mutation rules (mirrored from `holidayModel.set` / `deleteCurrentHoliday`):
-
-- Setting a return date when no active holiday exists → push
-  `{index: <len>, added: true, fromAsIso: <now>, toAsIso: <return date>}`.
-- Setting a return date when a holiday already exists → update its `toAsIso`
-  and mark `changed: true`.
-- Clearing the holiday → mark the active entry `deleted: true`. The cloud
-  removes it on the next SetData.
-
-Two HA helpers drive this:
-
-```yaml
-input_boolean:
-  elco_holiday_active:
-    name: ELCO Holiday active
-    icon: mdi:airplane
-input_datetime:
-  elco_holiday_until:
-    name: ELCO Holiday return date
-    icon: mdi:calendar-end
-    has_date: true
-    has_time: false
-```
-
-A single listener watches both. When either changes, the app reconciles:
-toggling `elco_holiday_active=on` with a future date in `elco_holiday_until`
-issues an add/change; toggling `off` issues a delete. The zone mode is forced
-to `Automatic` for an active holiday — the boiler firmware refuses the save
-otherwise.
-
-Read path: `sensor.elco_holiday_until` carries the active return date
-(`toAsIso`) as a `device_class: timestamp` state, `binary_sensor.elco_holiday_active`
-mirrors whether any non-deleted holiday exists.
-
-### Working payload shape
-
-Recovered from a captured browser SetData request. The shape is
-substantially different from the other writes; getting it wrong leads
-to either `ok=true` with a silently-dropped holiday OR HTTP 599
-"Bsb parameters read/write error":
-
-1. **Holiday mutations go in `viewModel.holidays`**, NOT
-   `zoneData.holidays`. The latter stays at `[]` (cached state).
-2. `viewModel` is a rich object with the zone-state echo:
-   ```
-   { holidays: [...], outsideTemp: "X °C", zoneNumber, zoneMode,
-     isZoneOff, isZoneAuto, isZoneReduced, isZoneComfort,
-     chComfortTemp, chReducedTemp,         <- scalars, not objects
-     coolComfortTemp, coolReducedTemp,
-     desiredTemp, antiFreezeTemp }
-   ```
-3. Both `plantData` and `zoneData` need a `__type__` discriminator
-   (`["my.entities.entityiface","my.entities.bsbplantdata"]` /
-   `bsbzonedata`) and a `__lastUpdatedOn__` ISO timestamp. Without
-   these the cloud's ASP.NET serializer parses the body as a generic
-   dict and the holiday mutation gets dropped.
-4. plantData and zoneData carry every field from the last GetData
-   response (full echo), including the cooling fields with their
-   zero values on a heat-only plant. The cloud only validates the
-   metadata wrapper, not the inner BSB params, once `__type__` is
-   present.
-
-Holiday DTO oddity (also in the captured payload):
-`fromAsEpoch: 0, toAsEpoch: 0` — zeros, not actual unix seconds. The
-JS `me()` constructor declares them but the JS `set()` method never
-populates them. Sending real epochs is harmless but unnecessary;
-zeros match the JS exactly.
-
-Failure-mode rogue's gallery (kept here for posterity):
-
-- Slim `{zone, mode, holidays}` payload → `ok=true`, dropped.
-- Full zoneData echo with holidays in zoneData → `ok=true`, dropped.
-- Full zoneData echo with `__type__` but holidays still in zoneData →
-  `ok=true`, dropped.
-- Full echo without `__type__` → HTTP 599 on params `2950542, 2950544`.
-- Echo with `coolComfortTemp/coolReducedTemp` (zeros) but no
-  `__type__` → same 599. Those param IDs are red herrings of the
-  type-routing failure path, not specific BSB datapoints.
-
-Cache-corruption side effect: a sequence of failed SetData attempts
-can poison the cloud's cache for `chComfortTemp` / `chReducedTemp`,
-leaving them at `value=4.0` with inverted `min/max=10/4` sentinels.
-
-The clean recovery is the **`PlantMenuBsb/WriteDataPoints/<gw>`**
-endpoint, which writes BSB datapoints by address directly. From a
-captured browser request:
-
-```
-POST /R2/PlantMenuBsb/WriteDataPoints/<gw>
+POST /api/v2/remote/bsbHolidays/<gw>/<zone>
 Content-Type: application/json
-[
-  {"address": 2950542, "newValueAsNumber": 19.5, "oldValueAsNumber": 4,
-   "newValueAsString": null, "oldValueAsString": null,
-   "newOsv": false, "oldOsv": false},
-  {"address": 2950544, "newValueAsNumber": 16.5, "oldValueAsNumber": 4,
-   "newValueAsString": null, "oldValueAsString": null,
-   "newOsv": false, "oldOsv": false}
-]
+Cookie: .AspNet.ApplicationCookie=<from /R2/Account/Login>
+
+{
+  "currentZoneMode": 1,                                  // current zone mode (0..3)
+  "new":  {"index": 0, "from": "2026-05-11T00:00", "to": "2026-05-12T00:00"},
+  "old":  {"index": 0, "from": "2026-05-11T00:00", "to": "2026-05-11T00:00", "osv": true}
+}
+→ HTTP 200 {"success": true}
 ```
 
-`2950542` = chComfortTemp BSB address, `2950544` = chReducedTemp BSB
-address (these are the same IDs that showed up in the 599 errors when
-SetData tried to write them indirectly). The endpoint is a granular
-backdoor for any BSB param the menu UI exposes; it does not go through
-the home/zone composite envelope and therefore avoids the corruption
-trap entirely. Equivalent recovery via Remocon mobile app: Chauffage →
-Scheduling → set comfort 19.5 (apply) → set reduced 16.5 (apply).
+The endpoint addresses a **fixed array of 8 holiday slots** on the BSB
+controller (indices 0..7). The mobile app always writes slot 0; we
+mirror that. Reading via `GET /api/v2/remote/bsbHolidays/<gw>/<zone>`
+returns all 8 (unused slots have `from=to=2026-01-01T00:00:00`).
 
-### Holiday writes: web ADD broken, web MODIFY + DELETE work
+ADD / MODIFY / DELETE are all the same write — pick the slot, set the
+desired `from` / `to` ISO datetimes. To clear, write the empty marker
+`2026-01-01T00:00 → 2026-01-01T00:00`.
 
-Empirically confirmed by setting via the mobile app (which DID persist)
-and then driving SetData against the persisted entry:
+**Year handling:** the boiler stores only month/day for holidays — the
+cloud annotates with the current year on read. Sending `2030-07-19`
+gets stored as `2026-07-19` (current year). For HA, just send today's
+year; the boiler only honors the month/day pair.
 
-| Operation | Web SetData (PlantHomeBsb/SetData) | Remocon mobile app |
-|-----------|------------------------------------|--------------------|
-| Add       | **silently dropped** (ok:true)     | works              |
-| Modify    | **works** (date-only ISO, changed=true on existing index) | works |
-| Delete    | works (by symmetry — `deleted:true` flag); untested but standard | works |
+**Auth:** the standard `/R2/Account/Login` session cookie
+(`.AspNet.ApplicationCookie`) authenticates `/api/v2/remote/...`
+requests too. The mobile app's `ar.authToken` header is an
+alternate scheme that we don't need.
 
-The web "Save" optimistically updates client state then drops the write
-server-side. The mobile app uses a different transport (likely a
-separate API endpoint or an additional side-call) that hasn't been
-captured.
+**Other /api/v2 endpoints** discovered in the same mobile-app capture
+(all auth via the same session cookie):
 
-Persisted holiday shape from GetData (note the **date-only** ISO format
-and the absence of `fromAsEpoch` / `toAsEpoch`):
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v2/remote/plants/lite` | list gateways |
+| `GET /api/v2/remote/bsbPlantData/<gw>?...` | plant data (DHW, flame, etc.) |
+| `GET /api/v2/remote/bsbZones/<gw>/<zone>` | zone data (mode, temps, holidays) |
+| `GET /api/v2/remote/bsbTimeProgs/<gw>/<ChZn1\|Dhw\|...>` | schedule |
+| `GET /api/v2/remote/bsbHolidays/<gw>/<zone>` | all 8 holiday slots |
+| `POST /api/v2/remote/bsbHolidays/<gw>/<zone>` | write a holiday slot |
+| `GET /api/v2/busErrors?gatewayId=<gw>&...` | bus errors |
+
+These are likely the right path for future migrations — they replace
+the legacy `/R2/PlantHomeBsb/...` endpoints with a clean REST API that
+the mobile app uses internally.
+
+### Historical: /R2 SetData holiday failure mode (PRE-/api/v2 work)
+
+Before discovering /api/v2/remote/bsbHolidays, AppDaemon tried to set
+holidays via `/R2/PlantHomeBsb/SetData/<gw>` (the legacy path the web
+UI uses). That endpoint silently dropped ADD operations regardless of
+payload shape and corrupted the `chComfortTemp` / `chReducedTemp`
+cloud cache on retry (manifested as `value=4.0` with inverted
+`min/max=10/4` sentinels). Recovery for cache corruption is the
+**`POST /R2/PlantMenuBsb/WriteDataPoints/<gw>`** endpoint:
 
 ```
-{ "index": 0,
-  "fromAsIso": "2026-05-11",
-  "toAsIso":   "2026-05-16",
-  "added": false, "deleted": false, "changed": false, "osv": false }
+[{"address": 2950542, "newValueAsNumber": 19.5, "oldValueAsNumber": 4,
+  "newOsv": false, "oldOsv": false, ...},
+ {"address": 2950544, "newValueAsNumber": 16.5, "oldValueAsNumber": 4,
+  ...}]
 ```
 
-To send a MODIFY, mirror exactly that shape (date-only ISO, no epoch
-fields), set `changed: true`, embed in `viewModel.holidays` of the
-SetData payload, and post via the same browser-matched envelope.
+where `2950542` / `2950544` are the BSB datapoint addresses for
+chComfortTemp / chReducedTemp.
 
-**Operational pattern**: keep one placeholder future-dated holiday set
-via the Remocon mobile app (e.g., one a year out). HA can then modify
-its `toAsIso` to whatever the input_datetime helper says, and toggle it
-on/off via the `deleted` flag, never needing to ADD via web again.
-
-The AppDaemon `on_holiday_changed` handler enforces this: when the user
-toggles HA's `input_boolean.elco_holiday_active=on` and no holiday is
-cached, it logs an error pointing back to this section instead of
-issuing a doomed-to-fail ADD SetData.
 
 ## Weekly schedule (read-only for now)
 

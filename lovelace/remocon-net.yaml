@@ -246,9 +246,31 @@ cards:
           ✈️ **Holiday active** — boiler will resume on
           {{ as_timestamp(states('sensor.elco_holiday_until')) | timestamp_custom('%A %d/%m/%Y', true) }}
           {% else %}
-          🏠 **No holiday set.** Pick a return date, toggle "Holiday active" on
-          to send the boiler into holiday mode from now until the return date.
-          Toggle off to clear.
+          🏠 **No holiday set on the boiler.**
+
+          Pick a return date and toggle *Holiday active* on to send the boiler
+          into holiday mode now. Toggle off to clear.
+
+          **Upcoming auto-trigger events** on `calendar.family`:
+
+          {%- set evs = state_attr('sensor.elco_upcoming_holidays', 'events') or [] %}
+          {%- if evs %}
+          {%- for e in evs %}
+          {%- set s = e.start %}
+          {%- set en = e.end %}
+          {%- set sd = (s | as_datetime).strftime('%a %d %b %Y') if 'T' in s else (strptime(s, '%Y-%m-%d')).strftime('%a %d %b %Y') %}
+          {%- set ed_raw = (en | as_datetime) if 'T' in en else (strptime(en, '%Y-%m-%d')) %}
+          {%- set ed = (ed_raw - timedelta(days=1)).strftime('%a %d %b %Y') %}
+          - **{{ e.summary }}** — boiler off {{ sd }} → return {{ ed }} (resumes the day after)
+          {%- endfor %}
+          {%- else %}
+          _None._
+          {%- endif %}
+
+          ℹ️ Auto-trigger fires when a `calendar.family` event's title starts
+          with **`Vacanze`**, **`Vacanza`**, **`Vacation`**, **`Vacances`**,
+          **`Vacaciones`** or **`Holiday`** (case-insensitive). Rename trips
+          to include the prefix to enrol them.
           {% endif %}
       - type: entities
         state_color: true

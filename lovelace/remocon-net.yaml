@@ -246,6 +246,9 @@ cards:
       - entity: input_datetime.elco_holiday_until
         name: Return date
         icon: mdi:calendar-end
+      - entity: input_boolean.elco_holiday_use_reduced
+        name: Stay in Reduced (else fully off)
+        icon: mdi:weather-night
       - type: conditional
         conditions:
           - entity: binary_sensor.elco_holiday_active
@@ -256,7 +259,43 @@ cards:
           icon: mdi:calendar-clock
 
   ##################################################################
-  # 6) Plant detail (Boiler status)
+  # 6) Runtime + cost today
+  ##################################################################
+  - type: glance
+    title: Today
+    state_color: true
+    columns: 3
+    entities:
+      - entity: sensor.elco_heating_active_today
+        name: Heating
+      - entity: sensor.elco_flame_on_today
+        name: Flame
+      - entity: sensor.elco_dhw_enabled_today
+        name: DHW
+      - entity: sensor.elco_heating_cost_today
+        name: Cost (est.)
+      - entity: sensor.elco_flame_on_count_last_hour
+        name: Cycles/hr
+
+  ##################################################################
+  # 7) Heating curve diagnostic — two-line overlay over 7 days.
+  #    If desired (orange) tracks outside (blue) inversely with the
+  #    right slope and offset, the boiler curve is well-tuned. If
+  #    desired stays flat through cold spells or overshoots warm
+  #    days, slope/parallel needs adjusting at the boiler menu.
+  ##################################################################
+  - type: history-graph
+    title: Heating curve (last 7d)
+    hours_to_show: 168
+    refresh_interval: 600
+    entities:
+      - entity: sensor.elco_outside_temperature
+        name: Outside
+      - entity: sensor.elco_desired_room_temperature
+        name: Desired room
+
+  ##################################################################
+  # 8) Plant detail (Boiler status)
   ##################################################################
   - type: entities
     title: Boiler status

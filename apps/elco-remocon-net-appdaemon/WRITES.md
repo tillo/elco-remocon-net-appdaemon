@@ -259,3 +259,47 @@ The "current temperature" shown in the Remocon hot-water screen is the DHW
 tank probe (`dhwStorageTemp` → `sensor.elco_domestic_hot_water_storage_temperature`).
 For room temperature, use `sensor.elco_room_temperature`. There is no third
 "boiler water" temp available from this API surface.
+
+## Holiday-stays-in-Reduced flag
+
+`zoneData.useReducedOperationModeOnHoliday` is a single bool that switches
+between two BSB behaviours during an active holiday:
+
+- `false` (controller default): the heating zone is fully off for the duration.
+- `true`: the zone drops to the **Reduced** setpoint instead. Useful when the
+  property has frost-sensitive plumbing or pets staying behind.
+
+Exposed read-side as `binary_sensor.elco_holiday_use_reduced`; toggled via
+`input_boolean.elco_holiday_use_reduced`. The listener mutates `zoneData.useReducedOperationModeOnHoliday` and POSTs `PlantHomeBsb/SetData`.
+
+## Weekly schedule write-back
+
+POST `/R2/PlantTimeProgBsb/SetTimeProg/<gw>` accepts:
+
+```
+{ progId: <int>, weeklyPlan: <new plan>, prevWeeklyPlan: <last known plan> }
+```
+
+`prevWeeklyPlan` is used by the cloud for conflict detection; the app caches
+the most recently fetched plan in `self.last_weekly_plan` for this purpose.
+
+The user-facing surface is a single staging entity, `input_text.elco_weekly_plan_json`:
+write a JSON document of the form
+
+```
+{
+  "plans": [
+    {"days": [<0..6>...], "slices": [{"from": <minutes>, "temp": 0 or 1}, ...]},
+    ...
+  ]
+}
+```
+
+into it. The app parses, merges the user's `plans` array on top of the cached
+`weeklyPlan` (preserving `ext`, `maxSwitches`, `tick`, `baseTemp`, etc.), then
+POSTs SetTimeProg. Validation is minimal — a rejected payload comes back as
+`ok=false` from the cloud and is logged.
+
+Slice temperature is the BSB **flag** (0 = reduced, 1 = comfort), not the
+actual °C. To change the °C, write through the existing `input_number.elco_ch_comfort_temp_set`
+/ `elco_ch_reduced_temp_set` helpers (routed to `SetTemperature`).

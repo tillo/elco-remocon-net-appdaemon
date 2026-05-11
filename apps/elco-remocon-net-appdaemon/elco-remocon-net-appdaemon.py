@@ -31,6 +31,13 @@ WRITE_CONTROLS = {
 # state semantics (added/changed/deleted flags) are non-trivial.
 HOLIDAY_DATE_ENTITY = "input_datetime.elco_holiday_until"
 HOLIDAY_ACTIVE_ENTITY = "input_boolean.elco_holiday_active"
+HOLIDAY_USE_REDUCED_ENTITY = "input_boolean.elco_holiday_use_reduced"
+
+# Schedule write — staged as a JSON blob in this input_text. When it changes
+# and parses cleanly, AppDaemon POSTs SetTimeProg. Wrapping it as a single
+# text field keeps the HA UI plumbing simple; richer editors can compose the
+# JSON via scripts or templating.
+SCHEDULE_JSON_ENTITY = "input_text.elco_weekly_plan_json"
 
 # Weekday index → entity-id suffix. Remocon JS uses Date.getDay() (0=Sunday) for
 # the day field on schedule slices, so we mirror that.
@@ -59,6 +66,8 @@ class Remocon(hass.Hass):
         # full zoneData/plantData snapshots required by SetTemperature (CH temps endpoint).
         self.last_full_zoneData = None
         self.last_full_plantData = None
+        # Last fetched weeklyPlan — needed as `prevWeeklyPlan` in SetTimeProg.
+        self.last_weekly_plan = None
 
         # fetch data immediately on startup
         self.log("Fetching remocon.net data immediately on startup")
@@ -73,6 +82,11 @@ class Remocon(hass.Hass):
             # one of them changes so an active=on toggle + a date pick land as one write.
             self.listen_state(self.on_holiday_changed, HOLIDAY_DATE_ENTITY)
             self.listen_state(self.on_holiday_changed, HOLIDAY_ACTIVE_ENTITY)
+            # Whether holiday drops to Reduced (off=false) or fully shuts CH (true).
+            # Default in BSB controllers is false (boiler fully off during holiday).
+            self.listen_state(self.on_holiday_use_reduced_changed, HOLIDAY_USE_REDUCED_ENTITY)
+            # Schedule JSON staging: on state change, parse and push to SetTimeProg.
+            self.listen_state(self.on_schedule_json_changed, SCHEDULE_JSON_ENTITY)
         else:
             self.log("Write controls disabled (set enable_writes: true in apps.yaml to enable)")
 
@@ -390,6 +404,45 @@ class Remocon(hass.Hass):
                 data,
             )
 
+            # Additional BsbZoneData fields not previously exposed.
+            if "chProtectionTemp" in zoneData:
+                _post_data("sensor.elco_ch_protection_temp", {
+                    "state": zoneData["chProtectionTemp"],
+                    "attributes": {
+                        "unit_of_measurement": "°C",
+                        "device_class": "temperature",
+                        "friendly_name": "Elco CH Frost Protection Temperature",
+                        "icon": "mdi:snowflake-thermometer",
+                    },
+                })
+            if "chHolidayTemp" in zoneData:
+                _post_data("sensor.elco_ch_holiday_temp", {
+                    "state": zoneData["chHolidayTemp"],
+                    "attributes": {
+                        "unit_of_measurement": "°C",
+                        "device_class": "temperature",
+                        "friendly_name": "Elco CH Holiday Setpoint",
+                        "icon": "mdi:airplane-clock",
+                    },
+                })
+            if "useReducedOperationModeOnHoliday" in zoneData:
+                _post_data("binary_sensor.elco_holiday_use_reduced", {
+                    "state": "on" if zoneData["useReducedOperationModeOnHoliday"] else "off",
+                    "attributes": {
+                        "friendly_name": "Elco Holiday stays in Reduced",
+                        "icon": "mdi:weather-night",
+                    },
+                })
+            if "hasRoomSensor" in zoneData:
+                _post_data("binary_sensor.elco_has_room_sensor", {
+                    "state": "on" if zoneData["hasRoomSensor"] else "off",
+                    "attributes": {
+                        "device_class": "connectivity",
+                        "friendly_name": "Elco has Room Sensor",
+                        "icon": "mdi:thermometer-probe",
+                    },
+                })
+
             # holidays: array of {index, fromAsIso, toAsIso, added, changed, deleted}
             # from BsbZoneData. The "current" holiday is the first non-deleted one.
             holidays = zoneData.get("holidays") or []
@@ -533,7 +586,11 @@ class Remocon(hass.Hass):
         if time_progs:
             comfort_c = float(data["zoneData"]["chComfortTemp"]["value"])
             reduced_c = float(data["zoneData"]["chReducedTemp"]["value"])
-            _post_schedule((time_progs[0] or {}).get("weeklyPlan") or {}, comfort_c, reduced_c)
+            weekly_plan = (time_progs[0] or {}).get("weeklyPlan") or {}
+            _post_schedule(weekly_plan, comfort_c, reduced_c)
+            # Cache for SetTimeProg's prevWeeklyPlan slot (cloud uses it for
+            # conflict detection against concurrent edits).
+            self.last_weekly_plan = weekly_plan
 
         # cache writable values for SetData payloads
         self.last_writable = {
@@ -547,6 +604,7 @@ class Remocon(hass.Hass):
                 "chComfortTemp": {"value": data["zoneData"]["chComfortTemp"]["value"]},
                 "chReducedTemp": {"value": data["zoneData"]["chReducedTemp"]["value"]},
                 "mode":          {"value": data["zoneData"]["mode"]["value"]},
+                "useReducedOperationModeOnHoliday": bool(data["zoneData"].get("useReducedOperationModeOnHoliday", False)),
             },
         }
         # Full plant/zone snapshots are needed by the SetTemperature endpoint, which
@@ -670,6 +728,15 @@ class Remocon(hass.Hass):
                 self.call_service("input_boolean/turn_off", entity_id=HOLIDAY_ACTIVE_ENTITY)
         except Exception as e:
             self.log(f"prime holiday helpers failed: {e}")
+
+        # Holiday Reduced mode mirror.
+        try:
+            if self.last_writable["zoneData"]["useReducedOperationModeOnHoliday"]:
+                self.call_service("input_boolean/turn_on", entity_id=HOLIDAY_USE_REDUCED_ENTITY)
+            else:
+                self.call_service("input_boolean/turn_off", entity_id=HOLIDAY_USE_REDUCED_ENTITY)
+        except Exception as e:
+            self.log(f"prime {HOLIDAY_USE_REDUCED_ENTITY} failed: {e}")
 
     def on_control_changed(self, entity, attribute, old, new, kwargs):
         """Listener for input_number / input_select changes. Pushes the new value to remocon-net.
@@ -968,3 +1035,125 @@ class Remocon(hass.Hass):
             self.run_in(self.get_remocon_data, 5)
         except Exception as e:
             self.error(f"Holiday SetData exception: {e}")
+
+    # ----- HOLIDAY-MODE-REDUCED FLAG -----
+
+    def on_holiday_use_reduced_changed(self, entity, attribute, old, new, kwargs):
+        """When the user toggles input_boolean.elco_holiday_use_reduced, push the
+        bool to zoneData.useReducedOperationModeOnHoliday via SetData. False (the
+        BSB default) shuts CH fully off during holiday; True drops it to the
+        Reduced setpoint instead."""
+        if new in ("unavailable", "unknown", None):
+            return
+        if not self.last_writable:
+            self.error(f"{entity}: cannot write — no GetData snapshot cached yet")
+            return
+        want = (new == "on")
+        current = bool(self.last_writable["zoneData"].get("useReducedOperationModeOnHoliday", False))
+        if want == current:
+            self.log(f"{entity}: no-op ({new} matches current)")
+            return
+        self.last_writable["zoneData"]["useReducedOperationModeOnHoliday"] = want
+        self._post_setdata_with_holiday_flag(want, reason=f"{entity} → {new}")
+
+    def _post_setdata_with_holiday_flag(self, use_reduced, reason):
+        gateway = self.args.get("gateway_id")
+        if not gateway:
+            self.error("Cannot write: gateway_id not configured")
+            return
+        plant = self.last_writable["plantData"]
+        zone = self.last_writable["zoneData"]
+        payload = {
+            "plantData": {
+                "dhwComfortTemp": {"value": plant["dhwComfortTemp"]["value"]},
+                "dhwReducedTemp": {"value": plant["dhwReducedTemp"]["value"]},
+                "dhwMode":        {"value": plant["dhwMode"]["value"]},
+            },
+            "zoneData": {
+                "zone": zone["zone"],
+                "mode": {"value": zone["mode"]["value"]},
+                "useReducedOperationModeOnHoliday": bool(use_reduced),
+            },
+            "viewModel": {"zoneNumber": zone["zone"]},
+        }
+        url = urljoin(self._base_url(), posixpath.join("R2/PlantHomeBsb/SetData", gateway))
+        self.log(f"SetData (holiday-reduced: {reason}): payload={json.dumps(payload)}")
+        try:
+            session = self._login()
+            response = session.post(url=url, json=payload)
+            if response.status_code != 200:
+                self.error(f"SetData HTTP {response.status_code}: {response.text[:300]}")
+                return
+            result = json.loads(response.text)
+            if not result.get("ok"):
+                self.error(f"SetData rejected: {result.get('message')} (debug: {result.get('debugMessage')})")
+                return
+            self.log(f"SetData ok ({reason})")
+            self.run_in(self.get_remocon_data, 5)
+        except Exception as e:
+            self.error(f"SetData exception: {e}")
+
+    # ----- SCHEDULE WRITE PATH -----
+
+    def on_schedule_json_changed(self, entity, attribute, old, new, kwargs):
+        """Pushes a new weekly plan to /R2/PlantTimeProgBsb/SetTimeProg/<gw>.
+
+        Expected `new` is a JSON string with shape:
+            {"plans": [{"days": [<0..6>...], "slices": [{"from": <min>, "temp": <0|1>}, ...]}, ...]}
+        ext, maxSwitches etc. are merged from the cached weeklyPlan.
+
+        Payload to cloud (mirrors the dashboard JS Re-constructor:
+            {progId, weeklyPlan, prevWeeklyPlan}
+        """
+        if new in ("unavailable", "unknown", None, ""):
+            return
+        try:
+            user_plan = json.loads(new)
+        except (ValueError, TypeError) as e:
+            self.error(f"{entity}: invalid JSON ({e}); ignoring write")
+            return
+        if not isinstance(user_plan, dict) or not isinstance(user_plan.get("plans"), list):
+            self.error(f"{entity}: JSON must be an object with a 'plans' list")
+            return
+
+        gateway = self.args.get("gateway_id")
+        if not gateway:
+            self.error("Cannot write schedule: gateway_id not configured")
+            return
+        zone = self.args.get("zone") or 1
+
+        # Fold the user's plans into the previously-cached weeklyPlan so we
+        # preserve ext/maxSwitches/tick/baseTemp etc. that the boiler expects.
+        prev = None
+        if self.last_full_zoneData:
+            # zoneData itself doesn't carry weeklyPlan; but the most recent
+            # GetData (when progIds=[zone]) put it in data.timeProgs[0]. Cache it.
+            prev = getattr(self, "last_weekly_plan", None)
+
+        merged = dict(prev) if isinstance(prev, dict) else {}
+        merged["plans"] = user_plan["plans"]
+        for k in ("ext", "maxSwitches", "tick", "baseTemp", "defaultTemp", "allowedTemp", "pilot"):
+            if k in user_plan:
+                merged[k] = user_plan[k]
+
+        payload = {
+            "progId": zone,
+            "weeklyPlan": merged,
+            "prevWeeklyPlan": prev,
+        }
+        url = urljoin(self._base_url(), posixpath.join("R2/PlantTimeProgBsb/SetTimeProg", gateway))
+        self.log(f"SetTimeProg ({entity} change): plans={len(merged.get('plans') or [])}")
+        try:
+            session = self._login()
+            response = session.post(url=url, json=payload)
+            if response.status_code != 200:
+                self.error(f"SetTimeProg HTTP {response.status_code}: {response.text[:300]}")
+                return
+            result = json.loads(response.text)
+            if not result.get("ok"):
+                self.error(f"SetTimeProg rejected: {result.get('message')} (debug: {result.get('debugMessage')})")
+                return
+            self.log("SetTimeProg ok; scheduling refresh")
+            self.run_in(self.get_remocon_data, 5)
+        except Exception as e:
+            self.error(f"SetTimeProg exception: {e}")

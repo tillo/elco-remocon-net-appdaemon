@@ -191,7 +191,11 @@ key | optional | type | default | description
 | binary_sensor.elco_room_temperature_error | Elco Room Temperature Error | zoneData.roomTempError |  |
 | binary_sensor.elco_holiday_active | Elco Holiday Active | zoneData.holidays |  |
 | sensor.elco_holiday_until | Elco Holiday Return Date | zoneData.holidays[].toAsIso | device_class: timestamp |
-| sensor.elco_schedule_{monday..sunday} | Per-weekday schedule slices | timeProgs[0].weeklyPlan | state = slice count, `slices` attribute carries `{from_min, from_hhmm, temp}` |
+| sensor.elco_schedule_{monday..sunday} | Per-weekday schedule slices | timeProgs[0].weeklyPlan | state = slice count, `slices` + `intervals` attributes (see WRITES.md) |
+| sensor.elco_ch_protection_temp | CH frost-protection temp | zoneData.chProtectionTemp | unit: °C |
+| sensor.elco_ch_holiday_temp | CH temperature held during holiday | zoneData.chHolidayTemp | unit: °C |
+| binary_sensor.elco_holiday_use_reduced | Holiday stays in Reduced (else fully off) | zoneData.useReducedOperationModeOnHoliday | writable via input_boolean.elco_holiday_use_reduced |
+| binary_sensor.elco_has_room_sensor | Whether the controller sees a room probe | zoneData.hasRoomSensor | device_class: connectivity |
 
 ## Remocon-NET-style dashboard
 

@@ -229,17 +229,14 @@ cards:
       detail: 1
 
   ##################################################################
-  # 5) Holiday card (Set holiday screen)
+  # 5) Holiday card
   #
-  # HOW IT WORKS:
-  # - The cloud web API silently drops ADD-via-SetData (confirmed via the
-  #   Remocon web UI: "Save" shows the holiday optimistically, then it
-  #   vanishes on page reload). Only the Remocon MOBILE app can ADD a
-  #   holiday; web SetData accepts MODIFY and DELETE on an existing entry.
-  # - Workflow: set a placeholder holiday on the mobile app (any future
-  #   date), then HA can modify its end date or delete it freely.
-  # - "Return date" input_datetime → modifies the cloud's existing holiday
-  # - "Holiday active" toggle off → deletes the cloud holiday
+  # Drives /api/v2/remote/bsbHolidays/<gw>/<zone> via AppDaemon. The boiler
+  # has 8 holiday slots; we always write slot 0 (mirrors what the Remocon
+  # mobile app does).
+  # - "Return date" input_datetime → the to-date of the slot (return day)
+  # - "Holiday active" toggle on  → write {from=today, to=return_date}
+  # - "Holiday active" toggle off → write the empty marker (2026-01-01)
   ##################################################################
   - type: vertical-stack
     cards:
@@ -249,20 +246,19 @@ cards:
           ✈️ **Holiday active** — boiler will resume on
           {{ as_timestamp(states('sensor.elco_holiday_until')) | timestamp_custom('%A %d/%m/%Y', true) }}
           {% else %}
-          ⚠️ **No holiday set on the boiler.**
-          The web API can only modify/delete an existing holiday, never add one.
-          To set a new holiday: open the Remocon-NET **mobile app** → pick any
-          future return date → save. Then HA can modify it from here.
+          🏠 **No holiday set.** Pick a return date, toggle "Holiday active" on
+          to send the boiler into holiday mode from now until the return date.
+          Toggle off to clear.
           {% endif %}
       - type: entities
         state_color: true
         entities:
           - entity: input_boolean.elco_holiday_active
-            name: Holiday active (off → cleared)
+            name: Holiday active
             icon: mdi:airplane
             secondary_info: last-changed
           - entity: input_datetime.elco_holiday_until
-            name: Return date (changes cloud)
+            name: Return date
             icon: mdi:calendar-end
           - entity: input_boolean.elco_holiday_use_reduced
             name: Stay in Reduced (else fully off)

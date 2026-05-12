@@ -129,7 +129,7 @@ cards:
               entity: input_select.elco_zone_mode_set
               name: Auto
               icon: mdi:clock-outline
-              color: indigo
+              color: green
               hide_state: true
               tap_action: { action: none }
           - type: conditional
@@ -250,17 +250,19 @@ cards:
       {%- set reduced_t = (state_attr('sensor.elco_schedule_monday','intervals') or [])
                           | selectattr('mode','eq','reduced')
                           | map(attribute='temp') | first | default(0) -%}
-      {#- Build (short, fingerprint) per day. Fingerprint = "start-end,start-end..." -#}
+      {#- Build (short, fingerprint) per day. Fingerprint = "start-end,start-end..."
+          HA's Jinja sandbox forbids list.append() / dict.update(); use list-concat
+          (+ [x]) on namespace attributes instead. -#}
       {%- set per_day = namespace(items=[]) -%}
       {%- for short, suf in days -%}
         {%- set iv = state_attr('sensor.elco_schedule_' ~ suf, 'intervals') or [] -%}
         {%- set c = iv | selectattr('mode','eq','comfort') | list -%}
-        {%- set windows = [] -%}
+        {%- set windows = namespace(l=[]) -%}
         {%- for x in c -%}
-          {%- set _ = windows.append(x.start_hhmm ~ '–' ~ x.end_hhmm) -%}
+          {%- set windows.l = windows.l + [x.start_hhmm ~ '–' ~ x.end_hhmm] -%}
         {%- endfor -%}
-        {%- set fp = windows | join(', ') if windows else 'off' -%}
-        {%- set _ = per_day.items.append((short, fp)) -%}
+        {%- set fp = windows.l | join(', ') if windows.l else 'off' -%}
+        {%- set per_day.items = per_day.items + [(short, fp)] -%}
       {%- endfor -%}
       {#- Collapse consecutive days with the same fingerprint into ranges -#}
       {%- set groups = namespace(items=[], cur_start=none, cur_end=none, cur_fp=none) -%}
@@ -270,12 +272,12 @@ cards:
         {%- elif fp == groups.cur_fp -%}
           {%- set groups.cur_end = short -%}
         {%- else -%}
-          {%- set _ = groups.items.append((groups.cur_start, groups.cur_end, groups.cur_fp)) -%}
+          {%- set groups.items = groups.items + [(groups.cur_start, groups.cur_end, groups.cur_fp)] -%}
           {%- set groups.cur_start = short -%}{%- set groups.cur_end = short -%}{%- set groups.cur_fp = fp -%}
         {%- endif -%}
       {%- endfor -%}
       {%- if groups.cur_fp is not none -%}
-        {%- set _ = groups.items.append((groups.cur_start, groups.cur_end, groups.cur_fp)) -%}
+        {%- set groups.items = groups.items + [(groups.cur_start, groups.cur_end, groups.cur_fp)] -%}
       {%- endif -%}
       {% for s, e, fp in groups.items -%}
       **{{ s }}{% if e != s %}–{{ e }}{% endif %}**&nbsp;&nbsp;{{ fp }}{% if not loop.last %}<br>{% endif %}
@@ -383,7 +385,9 @@ cards:
           {%- set price = states('sensor.elco_gas_price') | float(0) -%}
           {%- set hist = state_attr('sensor.elco_heating_monthly_history','history') or [] -%}
           {#- Build a {YYYY-MM: kWh} dict. recorder/statistics_during_period
-              returns `start` as a millisecond unix timestamp; convert. -#}
+              returns `start` as a millisecond unix timestamp; convert. HA's
+              Jinja sandbox forbids dict.update(); use the `combine` filter
+              (immutable dict merge) on a namespace attribute. -#}
           {%- set by_month = namespace(d={}) -%}
           {%- for h in hist -%}
             {%- set s = h.start -%}
@@ -392,7 +396,7 @@ cards:
             {%- else -%}
               {%- set k = s[:7] -%}
             {%- endif -%}
-            {%- set _ = by_month.d.update({k: (h.change | float(0))}) -%}
+            {%- set by_month.d = by_month.d | combine({k: (h.change | float(0))}) -%}
           {%- endfor -%}
           {%- set tm = now() -%}
           {%- set lm = (tm.replace(day=1) - timedelta(days=1)) -%}

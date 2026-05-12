@@ -297,39 +297,21 @@ cards:
             name: Cost
       - type: markdown
         content: |
-          {%- set hist = state_attr('sensor.elco_heating_monthly_history','history') or [] -%}
           {%- set price = states('sensor.elco_gas_price') | float(0) -%}
-          {#- Build a {YYYY-MM: kWh} dict from the history list. The `start`
-             field is an ISO datetime or a millisecond epoch depending on
-             HA version; handle both. -#}
-          {%- set by_month = namespace(d={}) -%}
-          {%- for h in hist -%}
-            {%- set s = h.start -%}
-            {%- if s is number -%}
-              {%- set dt = (s / 1000) | timestamp_custom('%Y-%m', false) -%}
-            {%- else -%}
-              {%- set dt = s[:7] -%}
-            {%- endif -%}
-            {%- set _ = by_month.d.update({dt: (h.change | float(0))}) -%}
-          {%- endfor -%}
+          {%- set this_kwh = states('sensor.elco_heating_energy_period') | float(0) -%}
+          {%- set last_kwh = state_attr('sensor.elco_heating_energy_period','last_period') | float(0) -%}
           {%- set tm = now() -%}
           {%- set lm = (tm.replace(day=1) - timedelta(days=1)) -%}
           {%- set lm2 = (lm.replace(day=1) - timedelta(days=1)) -%}
-          {%- macro fmt(yy, mm) -%}
-            {%- set key = '%04d-%02d' % (yy, mm) -%}
-            {%- if key in by_month.d -%}
-              {%- set kwh = by_month.d[key] -%}
-              {{ '%.1f' | format(kwh) }} kWh · {{ '%.2f' | format(kwh * price) }} CHF
-            {%- else -%}—{%- endif -%}
-          {%- endmacro -%}
           | Period | Usage |
           |--------|-------|
-          | **This month** ({{ tm.strftime('%b %Y') }}) | {{ fmt(tm.year, tm.month) }} |
-          | Last month ({{ lm.strftime('%b %Y') }}) | {{ fmt(lm.year, lm.month) }} |
-          | 2 months ago ({{ lm2.strftime('%b %Y') }}) | {{ fmt(lm2.year, lm2.month) }} |
-          | Same month last year ({{ tm.year - 1 }}) | {{ fmt(tm.year - 1, tm.month) }} |
+          | **This month** ({{ tm.strftime('%b %Y') }}) | {{ '%.1f' | format(this_kwh) }} kWh · {{ '%.2f' | format(this_kwh * price) }} CHF |
+          | Last month ({{ lm.strftime('%b %Y') }}) | {% if last_kwh > 0 %}{{ '%.1f' | format(last_kwh) }} kWh · {{ '%.2f' | format(last_kwh * price) }} CHF{% else %}— (set after the 1st){% endif %} |
+          | 2 months ago ({{ lm2.strftime('%b %Y') }}) | — |
+          | Same month last year ({{ tm.year - 1 }}) | — |
 
-          Price **{{ states('sensor.elco_gas_price') }} CHF/kWh**.
+          Price **{{ price }} CHF/kWh**. Older periods need a recorder-stats WS
+          poller — _follow-up_.
 
   ##################################################################
   # 7) Heating curve diagnostic — two-line overlay over 7 days.

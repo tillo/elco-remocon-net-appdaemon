@@ -183,26 +183,22 @@ cards:
   - type: markdown
     title: Weekly schedule
     content: |
-      {%- macro day_row(suffix) -%}
-      {%- set iv = state_attr('sensor.elco_schedule_' ~ suffix, 'intervals') or [] -%}
-      {%- if iv | count == 0 -%}—{%- else -%}
-      {%- for i in iv -%}
-      {%- if i.mode == 'comfort' -%}**☀ {{ i.start_hhmm }}–{{ i.end_hhmm }}** ({{ '%.1f' | format(i.temp) }}°)
-      {%- else -%}☾ {{ i.start_hhmm }}–{{ i.end_hhmm }} ({{ '%.1f' | format(i.temp) }}°)
-      {%- endif -%}
-      {%- if not loop.last %} · {% endif -%}
-      {%- endfor -%}
-      {%- endif -%}
-      {%- endmacro -%}
-      | Day | Intervals |
-      |-----|-----------|
-      | Mon | {{ day_row('monday') }} |
-      | Tue | {{ day_row('tuesday') }} |
-      | Wed | {{ day_row('wednesday') }} |
-      | Thu | {{ day_row('thursday') }} |
-      | Fri | {{ day_row('friday') }} |
-      | Sat | {{ day_row('saturday') }} |
-      | Sun | {{ day_row('sunday') }} |
+      {%- set days = [('Mon','monday'),('Tue','tuesday'),('Wed','wednesday'),
+                      ('Thu','thursday'),('Fri','friday'),('Sat','saturday'),
+                      ('Sun','sunday')] -%}
+      {%- set comfort_t = (state_attr('sensor.elco_schedule_monday','intervals') or [])
+                          | selectattr('mode','eq','comfort')
+                          | map(attribute='temp') | first | default(0) -%}
+      {%- set reduced_t = (state_attr('sensor.elco_schedule_monday','intervals') or [])
+                          | selectattr('mode','eq','reduced')
+                          | map(attribute='temp') | first | default(0) -%}
+      {% for short, suf in days -%}
+      {%- set iv = state_attr('sensor.elco_schedule_' ~ suf, 'intervals') or [] -%}
+      {%- set c = iv | selectattr('mode','eq','comfort') | list -%}
+      **{{ short }}**&nbsp;&nbsp;{% if c %}{% for x in c %}{{ x.start_hhmm }}–{{ x.end_hhmm }}{% if not loop.last %},&nbsp;{% endif %}{% endfor %}{% else %}off{% endif %}{% if not loop.last %}<br>{% endif %}
+      {%- endfor %}
+
+      ☀ Comfort **{{ '%.1f' | format(comfort_t) }}°** · ☾ Reduced **{{ '%.1f' | format(reduced_t) }}°** outside
 
   ##################################################################
   # 4) Hot water card (Hot water screen)
@@ -241,18 +237,8 @@ cards:
   - type: vertical-stack
     cards:
       - type: markdown
+        title: Upcoming auto-trigger holidays
         content: |
-          {% if is_state('binary_sensor.elco_holiday_active', 'on') %}
-          ✈️ **Holiday active** — boiler will resume on
-          {{ as_timestamp(states('sensor.elco_holiday_until')) | timestamp_custom('%A %d/%m/%Y', true) }}
-          {% else %}
-          🏠 **No holiday set on the boiler.**
-
-          Pick a return date and toggle *Holiday active* on to send the boiler
-          into holiday mode now. Toggle off to clear.
-
-          **Upcoming auto-trigger events** on `calendar.family`:
-
           {%- set evs = state_attr('sensor.elco_upcoming_holidays', 'events') or [] %}
           {%- if evs %}
           {%- for e in evs %}
@@ -261,31 +247,13 @@ cards:
           {%- set sd = (s | as_datetime).strftime('%a %d %b %Y') if 'T' in s else (strptime(s, '%Y-%m-%d')).strftime('%a %d %b %Y') %}
           {%- set ed_raw = (en | as_datetime) if 'T' in en else (strptime(en, '%Y-%m-%d')) %}
           {%- set ed = (ed_raw - timedelta(days=1)).strftime('%a %d %b %Y') %}
-          - **{{ e.summary }}** — boiler off {{ sd }} → return {{ ed }} (resumes the day after)
+          - **{{ e.summary }}** — off {{ sd }} → return {{ ed }}
           {%- endfor %}
           {%- else %}
           _None._
           {%- endif %}
 
-          ℹ️ Auto-trigger fires when a `calendar.family` event's title starts
-          with **`Vacanze`**, **`Vacanza`**, **`Vacation`**, **`Vacances`**,
-          **`Vacaciones`** or **`Holiday`** (case-insensitive). Rename trips
-          to include the prefix to enrol them.
-
-          _Last refreshed: {{ as_timestamp(states.sensor.elco_upcoming_holidays.last_updated) | timestamp_custom('%a %d %b %H:%M') }}._
-          Auto-refreshes every 15 min and on Google Calendar state changes;
-          tap below to force a refresh after editing the calendar.
-          {% endif %}
-      - type: conditional
-        conditions:
-          - entity: binary_sensor.elco_holiday_active
-            state: 'off'
-        card:
-          type: entities
-          entities:
-            - entity: input_button.elco_holidays_refresh
-              name: Refresh upcoming holidays
-              icon: mdi:calendar-refresh
+          Prefix `calendar.family` titles with `Vacanz*` (or `Holiday`) to auto-enrol.
       - type: entities
         state_color: true
         entities:
@@ -299,66 +267,69 @@ cards:
           - entity: input_boolean.elco_holiday_use_reduced
             name: Stay in Reduced (else fully off)
             icon: mdi:weather-night
-          - type: conditional
-            conditions:
-              - entity: binary_sensor.elco_holiday_active
-                state: 'on'
-            row:
-              entity: sensor.elco_holiday_until
-              name: Boiler reports holiday until
-              icon: mdi:calendar-clock
+          - entity: input_button.elco_holidays_refresh
+            name: Refresh upcoming
+            icon: mdi:calendar-refresh
 
   ##################################################################
-  # 6) Runtime + cost today
+  # 6) Gas: today + monthly comparison
+  #
+  # Top row: today's flame runtime / kWh / cost (from history_stats
+  # + utility_meter daily + cost template).
+  #
+  # Markdown table: this/last/2-months-ago/same-month-last-year — sourced
+  # from sensor.elco_heating_monthly_history (trigger-template that calls
+  # recorder.statistics_during_period every 6h). Missing months render as
+  # "—" until enough history accumulates.
   ##################################################################
-  - type: glance
-    title: Today
-    state_color: true
-    columns: 3
-    entities:
-      - entity: sensor.elco_heating_active_today
-        name: Heating
-      - entity: sensor.elco_flame_on_today
-        name: Flame
-      - entity: sensor.elco_dhw_enabled_today
-        name: DHW
-      - entity: sensor.elco_heating_cost_today
-        name: Cost (est.)
-      - entity: sensor.elco_flame_on_count_last_hour
-        name: Cycles/hr
+  - type: vertical-stack
+    cards:
+      - type: glance
+        title: Today
+        show_state: true
+        columns: 3
+        entities:
+          - entity: sensor.elco_flame_on_today
+            name: Flame
+          - entity: sensor.elco_heating_energy_day
+            name: Energy
+          - entity: sensor.elco_heating_cost_today
+            name: Cost
+      - type: markdown
+        content: |
+          {%- set hist = state_attr('sensor.elco_heating_monthly_history','history') or [] -%}
+          {%- set price = states('sensor.elco_gas_price') | float(0) -%}
+          {#- Build a {YYYY-MM: kWh} dict from the history list. The `start`
+             field is an ISO datetime or a millisecond epoch depending on
+             HA version; handle both. -#}
+          {%- set by_month = namespace(d={}) -%}
+          {%- for h in hist -%}
+            {%- set s = h.start -%}
+            {%- if s is number -%}
+              {%- set dt = (s / 1000) | timestamp_custom('%Y-%m', false) -%}
+            {%- else -%}
+              {%- set dt = s[:7] -%}
+            {%- endif -%}
+            {%- set _ = by_month.d.update({dt: (h.change | float(0))}) -%}
+          {%- endfor -%}
+          {%- set tm = now() -%}
+          {%- set lm = (tm.replace(day=1) - timedelta(days=1)) -%}
+          {%- set lm2 = (lm.replace(day=1) - timedelta(days=1)) -%}
+          {%- macro fmt(yy, mm) -%}
+            {%- set key = '%04d-%02d' % (yy, mm) -%}
+            {%- if key in by_month.d -%}
+              {%- set kwh = by_month.d[key] -%}
+              {{ '%.1f' | format(kwh) }} kWh · {{ '%.2f' | format(kwh * price) }} CHF
+            {%- else -%}—{%- endif -%}
+          {%- endmacro -%}
+          | Period | Usage |
+          |--------|-------|
+          | **This month** ({{ tm.strftime('%b %Y') }}) | {{ fmt(tm.year, tm.month) }} |
+          | Last month ({{ lm.strftime('%b %Y') }}) | {{ fmt(lm.year, lm.month) }} |
+          | 2 months ago ({{ lm2.strftime('%b %Y') }}) | {{ fmt(lm2.year, lm2.month) }} |
+          | Same month last year ({{ tm.year - 1 }}) | {{ fmt(tm.year - 1, tm.month) }} |
 
-  ##################################################################
-  # 6b) Gas usage & cost — three time horizons in two rows of three.
-  #
-  # Today  : flame-on time since local midnight × 14 kW (modelled by
-  #          history_stats + Riemann integration of elco_heating_power)
-  # Month  : utility_meter bucket of the Riemann integration, resets
-  #          on the 1st of each month at 00:00 local
-  # Lifetime: the Riemann integration itself (resets only on HA recorder
-  #           purge or on entity recreation)
-  #
-  # Cost = energy × elco_gas_price (CHF/kWh, currently 0.18099 — Energiapro
-  # Confort tariff, see template comment for source).
-  ##################################################################
-  - type: glance
-    title: Gas usage & cost
-    show_state: true
-    columns: 3
-    entities:
-      - entity: sensor.elco_heating_energy_day
-        name: Energy (today)
-      - entity: sensor.elco_heating_energy_period
-        name: Energy (this month)
-      - entity: sensor.elco_heating_energy_total
-        name: Energy (lifetime)
-      - entity: sensor.elco_heating_cost_today
-        name: Cost (today)
-      - entity: sensor.elco_heating_cost_period
-        name: Cost (this month)
-      - entity: sensor.elco_heating_cost_total
-        name: Cost (lifetime)
-      - entity: sensor.elco_gas_price
-        name: Price (CHF/kWh)
+          Price **{{ states('sensor.elco_gas_price') }} CHF/kWh**.
 
   ##################################################################
   # 7) Heating curve diagnostic — two-line overlay over 7 days.

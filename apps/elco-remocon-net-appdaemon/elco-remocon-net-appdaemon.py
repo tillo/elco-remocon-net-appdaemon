@@ -63,6 +63,12 @@ class Remocon(hass.Hass):
             refresh_rate = 60
         self.log(f"Will fetch remocon.net data every {refresh_rate} min")
         self.run_every(self.get_remocon_data, datetime.now(), refresh_rate * 60)
+        # Monthly history of heating-energy lifetime via HA's WS-only
+        # recorder/statistics_during_period. Runs every 6h. Publishes the
+        # result to sensor.elco_heating_monthly_history for the dashboard
+        # comparison card.
+        self.run_every(self.refresh_monthly_stats,
+                       datetime.now() + timedelta(seconds=30), 6 * 3600)
 
         # cache of writable values from the latest GetData; used to build SetData payloads
         # since SetData requires both plantData and zoneData blocks.
@@ -1147,3 +1153,93 @@ class Remocon(hass.Hass):
             self.run_in(self.get_remocon_data, 5)
         except Exception as e:
             self.error(f"SetTimeProg exception: {e}")
+
+    # ----- MONTHLY ENERGY HISTORY (recorder.statistics_during_period via WS) -----
+
+    def refresh_monthly_stats(self, kwargs):
+        """Query HA's recorder/statistics_during_period WebSocket command for
+        the last ~14 months of sensor.elco_heating_energy_total, then publish
+        the result to sensor.elco_heating_monthly_history (state = number of
+        months returned, attribute history = the list).
+
+        Why WS: recorder.statistics_during_period is exposed only as a WS
+        command, not a service — trigger-template sensors couldn't use it.
+        AppDaemon already has the HA bearer token in its config, so opening a
+        secondary WS connection from here is straightforward.
+        """
+        try:
+            import asyncio
+            from datetime import timedelta as _td
+            start = (datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                     - _td(days=400)).replace(day=1)
+            result = asyncio.run(self._ws_statistics_during_period(
+                statistic_id="sensor.elco_heating_energy_total",
+                start_iso=start.isoformat(),
+                period="month",
+            ))
+            if result is None:
+                self.log("refresh_monthly_stats: WS query failed; skipping publish")
+                return
+
+            try:
+                ha_url = self.args.get("ha_url") or self.config["plugins"]["HASS"]["ha_url"]
+            except Exception:
+                self.error("refresh_monthly_stats: no ha_url configured")
+                return
+            data = {
+                "state": len(result),
+                "attributes": {
+                    "friendly_name": "Elco heating monthly history",
+                    "icon": "mdi:calendar-month",
+                    "history": result,
+                },
+            }
+            url = f"{ha_url}/api/states/sensor.elco_heating_monthly_history"
+            headers = {"Authorization": f"Bearer {self.args['bearer_token']}",
+                       "Content-Type": "application/json"}
+            requests.post(url, json=data, headers=headers, timeout=10)
+            self.log(f"refresh_monthly_stats: published {len(result)} monthly buckets")
+        except Exception as e:
+            self.error(f"refresh_monthly_stats exception: {e}")
+
+    async def _ws_statistics_during_period(self, statistic_id, start_iso, period):
+        """Open a short-lived WS connection to HA, run statistics_during_period,
+        return the result list or None on error."""
+        import aiohttp
+        try:
+            ha_url = self.args.get("ha_url") or self.config["plugins"]["HASS"]["ha_url"]
+        except Exception:
+            return None
+        # http -> ws, https -> wss
+        ws_url = ha_url.replace("https://", "wss://").replace("http://", "ws://") + "/api/websocket"
+        token = self.args["bearer_token"]
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(ws_url, timeout=10) as ws:
+                    # auth handshake
+                    hello = await ws.receive_json()
+                    if hello.get("type") != "auth_required":
+                        self.error(f"WS expected auth_required, got {hello}")
+                        return None
+                    await ws.send_json({"type": "auth", "access_token": token})
+                    ok = await ws.receive_json()
+                    if ok.get("type") != "auth_ok":
+                        self.error(f"WS auth failed: {ok}")
+                        return None
+                    # the actual query
+                    await ws.send_json({
+                        "id": 1,
+                        "type": "recorder/statistics_during_period",
+                        "start_time": start_iso,
+                        "period": period,
+                        "statistic_ids": [statistic_id],
+                        "types": ["change"],
+                    })
+                    resp = await ws.receive_json()
+                    if not resp.get("success"):
+                        self.error(f"WS stats query rejected: {resp}")
+                        return None
+                    return (resp.get("result") or {}).get(statistic_id) or []
+        except Exception as e:
+            self.error(f"WS stats query exception: {e}")
+            return None

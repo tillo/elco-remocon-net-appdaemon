@@ -111,67 +111,125 @@ cards:
                 value: >-
                   {{ (states('input_number.elco_ch_comfort_temp_set') | float + 0.5) | round(1) }}
 
-      # 4 mode buttons — same look as the Remocon AUTO / COMFORT / REDUCED / OFF row.
-      # tap_action calls input_select.select_option; the AppDaemon write listener
-      # propagates the change to the boiler.
+      # 4 mode buttons — Auto / Comfort / Reduced / Off (Protection). The
+      # currently-active mode renders as a coloured tile; the others as plain
+      # buttons. Tapping a non-active button writes the new value to
+      # input_select.elco_zone_mode_set; AppDaemon picks the change up and
+      # propagates to the boiler.
       - type: horizontal-stack
         cards:
-          - type: button
-            name: Auto
-            icon: mdi:clock-outline
-            tap_action:
-              action: call-service
-              service: input_select.select_option
-              target:
-                entity_id: input_select.elco_zone_mode_set
-              data: { option: Automatic }
-            state_color: true
-            entity: input_select.elco_zone_mode_set
-          - type: button
-            name: Comfort
-            icon: mdi:weather-sunny
-            tap_action:
-              action: call-service
-              service: input_select.select_option
-              target:
-                entity_id: input_select.elco_zone_mode_set
-              data: { option: Comfort }
-            state_color: true
-            entity: input_select.elco_zone_mode_set
-          - type: button
-            name: Reduced
-            icon: mdi:weather-night
-            tap_action:
-              action: call-service
-              service: input_select.select_option
-              target:
-                entity_id: input_select.elco_zone_mode_set
-              data: { option: Reduced }
-            state_color: true
-            entity: input_select.elco_zone_mode_set
-          - type: button
-            name: Off
-            icon: mdi:power
-            tap_action:
-              action: call-service
-              service: input_select.select_option
-              target:
-                entity_id: input_select.elco_zone_mode_set
-              data: { option: Protection }
-            state_color: true
-            entity: input_select.elco_zone_mode_set
-
-      # Footer status — mirrors the Remocon "Auto mode active 19.5°C Until …" line.
-      - type: markdown
-        content: |
-          **{{ states('sensor.elco_room_operation_mode_heating') }} mode active**
-
-          {{ states('sensor.elco_desired_room_temperature') }} °C —
-          {% if is_state('binary_sensor.elco_holiday_active', 'on') %}
-          Holiday until {{ as_timestamp(states('sensor.elco_holiday_until')) | timestamp_custom('%A %d/%m', true) }}
-          {% else %}
-          Schedule following weekly plan
-          {% endif %}
+          # --- Auto ---
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: input_select.elco_zone_mode_set
+                state: Automatic
+            card:
+              type: tile
+              entity: input_select.elco_zone_mode_set
+              name: Auto
+              icon: mdi:clock-outline
+              color: indigo
+              hide_state: true
+              tap_action: { action: none }
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: input_select.elco_zone_mode_set
+                state_not: Automatic
+            card:
+              type: button
+              name: Auto
+              icon: mdi:clock-outline
+              tap_action:
+                action: call-service
+                service: input_select.select_option
+                target: { entity_id: input_select.elco_zone_mode_set }
+                data: { option: Automatic }
+          # --- Comfort ---
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: input_select.elco_zone_mode_set
+                state: Comfort
+            card:
+              type: tile
+              entity: input_select.elco_zone_mode_set
+              name: Comfort
+              icon: mdi:weather-sunny
+              color: orange
+              hide_state: true
+              tap_action: { action: none }
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: input_select.elco_zone_mode_set
+                state_not: Comfort
+            card:
+              type: button
+              name: Comfort
+              icon: mdi:weather-sunny
+              tap_action:
+                action: call-service
+                service: input_select.select_option
+                target: { entity_id: input_select.elco_zone_mode_set }
+                data: { option: Comfort }
+          # --- Reduced ---
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: input_select.elco_zone_mode_set
+                state: Reduced
+            card:
+              type: tile
+              entity: input_select.elco_zone_mode_set
+              name: Reduced
+              icon: mdi:weather-night
+              color: blue
+              hide_state: true
+              tap_action: { action: none }
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: input_select.elco_zone_mode_set
+                state_not: Reduced
+            card:
+              type: button
+              name: Reduced
+              icon: mdi:weather-night
+              tap_action:
+                action: call-service
+                service: input_select.select_option
+                target: { entity_id: input_select.elco_zone_mode_set }
+                data: { option: Reduced }
+          # --- Off (Protection) ---
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: input_select.elco_zone_mode_set
+                state: Protection
+            card:
+              type: tile
+              entity: input_select.elco_zone_mode_set
+              name: 'Off'
+              icon: mdi:power
+              color: grey
+              hide_state: true
+              tap_action: { action: none }
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: input_select.elco_zone_mode_set
+                state_not: Protection
+            card:
+              type: button
+              name: 'Off'
+              icon: mdi:power
+              tap_action:
+                action: call-service
+                service: input_select.select_option
+                target: { entity_id: input_select.elco_zone_mode_set }
+                data: { option: Protection }
 
   ##################################################################
   # 3) Weekly schedule (Chauffage screen 2)
@@ -183,19 +241,44 @@ cards:
   - type: markdown
     title: Weekly schedule
     content: |
-      {%- set days = [('Mon','monday'),('Tue','tuesday'),('Wed','wednesday'),
-                      ('Thu','thursday'),('Fri','friday'),('Sat','saturday'),
-                      ('Sun','sunday')] -%}
+      {%- set days = [('Sun','sunday'),('Mon','monday'),('Tue','tuesday'),
+                      ('Wed','wednesday'),('Thu','thursday'),
+                      ('Fri','friday'),('Sat','saturday')] -%}
       {%- set comfort_t = (state_attr('sensor.elco_schedule_monday','intervals') or [])
                           | selectattr('mode','eq','comfort')
                           | map(attribute='temp') | first | default(0) -%}
       {%- set reduced_t = (state_attr('sensor.elco_schedule_monday','intervals') or [])
                           | selectattr('mode','eq','reduced')
                           | map(attribute='temp') | first | default(0) -%}
-      {% for short, suf in days -%}
-      {%- set iv = state_attr('sensor.elco_schedule_' ~ suf, 'intervals') or [] -%}
-      {%- set c = iv | selectattr('mode','eq','comfort') | list -%}
-      **{{ short }}**&nbsp;&nbsp;{% if c %}{% for x in c %}{{ x.start_hhmm }}–{{ x.end_hhmm }}{% if not loop.last %},&nbsp;{% endif %}{% endfor %}{% else %}off{% endif %}{% if not loop.last %}<br>{% endif %}
+      {#- Build (short, fingerprint) per day. Fingerprint = "start-end,start-end..." -#}
+      {%- set per_day = namespace(items=[]) -%}
+      {%- for short, suf in days -%}
+        {%- set iv = state_attr('sensor.elco_schedule_' ~ suf, 'intervals') or [] -%}
+        {%- set c = iv | selectattr('mode','eq','comfort') | list -%}
+        {%- set windows = [] -%}
+        {%- for x in c -%}
+          {%- set _ = windows.append(x.start_hhmm ~ '–' ~ x.end_hhmm) -%}
+        {%- endfor -%}
+        {%- set fp = windows | join(', ') if windows else 'off' -%}
+        {%- set _ = per_day.items.append((short, fp)) -%}
+      {%- endfor -%}
+      {#- Collapse consecutive days with the same fingerprint into ranges -#}
+      {%- set groups = namespace(items=[], cur_start=none, cur_end=none, cur_fp=none) -%}
+      {%- for short, fp in per_day.items -%}
+        {%- if groups.cur_fp is none -%}
+          {%- set groups.cur_start = short -%}{%- set groups.cur_end = short -%}{%- set groups.cur_fp = fp -%}
+        {%- elif fp == groups.cur_fp -%}
+          {%- set groups.cur_end = short -%}
+        {%- else -%}
+          {%- set _ = groups.items.append((groups.cur_start, groups.cur_end, groups.cur_fp)) -%}
+          {%- set groups.cur_start = short -%}{%- set groups.cur_end = short -%}{%- set groups.cur_fp = fp -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- if groups.cur_fp is not none -%}
+        {%- set _ = groups.items.append((groups.cur_start, groups.cur_end, groups.cur_fp)) -%}
+      {%- endif -%}
+      {% for s, e, fp in groups.items -%}
+      **{{ s }}{% if e != s %}–{{ e }}{% endif %}**&nbsp;&nbsp;{{ fp }}{% if not loop.last %}<br>{% endif %}
       {%- endfor %}
 
       ☀ Comfort **{{ '%.1f' | format(comfort_t) }}°** · ☾ Reduced **{{ '%.1f' | format(reduced_t) }}°** outside
@@ -253,7 +336,7 @@ cards:
           _None._
           {%- endif %}
 
-          Prefix `calendar.family` titles with `Vacanz*` (or `Holiday`) to auto-enrol.
+          Prefix `calendar.family` titles with `Vacanz*` to auto-enrol.
       - type: entities
         state_color: true
         entities:
@@ -298,20 +381,38 @@ cards:
       - type: markdown
         content: |
           {%- set price = states('sensor.elco_gas_price') | float(0) -%}
-          {%- set this_kwh = states('sensor.elco_heating_energy_period') | float(0) -%}
-          {%- set last_kwh = state_attr('sensor.elco_heating_energy_period','last_period') | float(0) -%}
+          {%- set hist = state_attr('sensor.elco_heating_monthly_history','history') or [] -%}
+          {#- Build a {YYYY-MM: kWh} dict. recorder/statistics_during_period
+              returns `start` as a millisecond unix timestamp; convert. -#}
+          {%- set by_month = namespace(d={}) -%}
+          {%- for h in hist -%}
+            {%- set s = h.start -%}
+            {%- if s is number -%}
+              {%- set k = (s / 1000) | timestamp_custom('%Y-%m', false) -%}
+            {%- else -%}
+              {%- set k = s[:7] -%}
+            {%- endif -%}
+            {%- set _ = by_month.d.update({k: (h.change | float(0))}) -%}
+          {%- endfor -%}
           {%- set tm = now() -%}
           {%- set lm = (tm.replace(day=1) - timedelta(days=1)) -%}
           {%- set lm2 = (lm.replace(day=1) - timedelta(days=1)) -%}
+          {%- set this_kwh = states('sensor.elco_heating_energy_period') | float(0) -%}
+          {%- macro fmt(yy, mm) -%}
+            {%- set k = '%04d-%02d' % (yy, mm) -%}
+            {%- if k in by_month.d -%}
+              {%- set kwh = by_month.d[k] -%}
+              {{ '%.1f' | format(kwh) }} kWh · {{ '%.2f' | format(kwh * price) }} CHF
+            {%- else -%}—{%- endif -%}
+          {%- endmacro -%}
           | Period | Usage |
           |--------|-------|
           | **This month** ({{ tm.strftime('%b %Y') }}) | {{ '%.1f' | format(this_kwh) }} kWh · {{ '%.2f' | format(this_kwh * price) }} CHF |
-          | Last month ({{ lm.strftime('%b %Y') }}) | {% if last_kwh > 0 %}{{ '%.1f' | format(last_kwh) }} kWh · {{ '%.2f' | format(last_kwh * price) }} CHF{% else %}— (set after the 1st){% endif %} |
-          | 2 months ago ({{ lm2.strftime('%b %Y') }}) | — |
-          | Same month last year ({{ tm.year - 1 }}) | — |
+          | Last month ({{ lm.strftime('%b %Y') }}) | {{ fmt(lm.year, lm.month) }} |
+          | 2 months ago ({{ lm2.strftime('%b %Y') }}) | {{ fmt(lm2.year, lm2.month) }} |
+          | Same month last year ({{ tm.year - 1 }}) | {{ fmt(tm.year - 1, tm.month) }} |
 
-          Price **{{ price }} CHF/kWh**. Older periods need a recorder-stats WS
-          poller — _follow-up_.
+          Price **{{ price }} CHF/kWh**.
 
   ##################################################################
   # 7) Heating curve diagnostic — two-line overlay over 7 days.

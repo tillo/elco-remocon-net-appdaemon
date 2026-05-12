@@ -328,28 +328,37 @@ cards:
         name: Cycles/hr
 
   ##################################################################
-  # 6b) Gas energy + period cost — sourced from the Riemann-integration
-  #     sensor (sensor.elco_heating_power → utility_meter monthly).
-  #     The price tile shows the currently-applied tariff (template-
-  #     held; edit the configmap when contract rates change).
+  # 6b) Gas usage & cost — three time horizons in two rows of three.
+  #
+  # Today  : flame-on time since local midnight × 14 kW (modelled by
+  #          history_stats + Riemann integration of elco_heating_power)
+  # Month  : utility_meter bucket of the Riemann integration, resets
+  #          on the 1st of each month at 00:00 local
+  # Lifetime: the Riemann integration itself (resets only on HA recorder
+  #           purge or on entity recreation)
+  #
+  # Cost = energy × elco_gas_price (CHF/kWh, currently 0.18099 — Energiapro
+  # Confort tariff, see template comment for source).
   ##################################################################
   - type: glance
-    title: Gas (this period)
+    title: Gas usage & cost
     show_state: true
     columns: 3
     entities:
-      - entity: sensor.elco_heating_energy_period
-        name: Energy
-      - entity: sensor.elco_heating_cost_period
-        name: Cost
-      - entity: sensor.elco_gas_price
-        name: Price (CHF/kWh)
       - entity: sensor.elco_heating_energy_day
         name: Energy (today)
+      - entity: sensor.elco_heating_energy_period
+        name: Energy (this month)
       - entity: sensor.elco_heating_energy_total
         name: Energy (lifetime)
-      - entity: sensor.elco_heating_energy_total_cost
+      - entity: sensor.elco_heating_cost_today
+        name: Cost (today)
+      - entity: sensor.elco_heating_cost_period
+        name: Cost (this month)
+      - entity: sensor.elco_heating_cost_total
         name: Cost (lifetime)
+      - entity: sensor.elco_gas_price
+        name: Price (CHF/kWh)
 
   ##################################################################
   # 7) Heating curve diagnostic — two-line overlay over 7 days.

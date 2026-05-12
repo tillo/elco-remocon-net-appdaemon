@@ -1,0 +1,68 @@
+## climate.elco_chauffage — drop-in YAML for AFTER installing the HACS
+## `climate-template` integration: https://github.com/jcwillox/hass-template-climate
+##
+## Once installed, paste this block into the HA configuration.yaml fleet
+## configmap (top-level, sibling to `template:` / `sensor:` etc.). It registers
+## a proper climate.* entity backed by the existing input_number /
+## input_select helpers — HomeKit, Alexa, and the native HA thermostat-card
+## will then see a unified thermostat for the Elco zone.
+##
+## Voice integration (Google Assistant) already works on the underlying
+## helpers via entity_config in google_assistant: — this YAML is only needed
+## for HomeKit / Alexa parity and for the thermostat-card UI in HA itself.
+
+climate:
+  - platform: climate_template
+    climates:
+      elco_chauffage:
+        friendly_name: "ELCO Chauffage"
+        unique_id: elco_chauffage_climate
+        min_temp: 10
+        max_temp: 30
+        precision: 0.5
+        temperature_unit: C
+
+        current_temperature_template: "{{ states('sensor.elco_room_temperature') | float(0) }}"
+        target_temperature_template:  "{{ states('sensor.elco_desired_room_temperature') | float(0) }}"
+
+        # hvac_mode is heat unless zone is in Protection (then off).
+        hvac_modes:
+          - 'heat'
+          - 'off'
+        hvac_mode_template: >-
+          {% if is_state('input_select.elco_zone_mode_set', 'Protection') %}off
+          {% else %}heat{% endif %}
+        # hvac_action drives the "currently heating" pill on the card.
+        hvac_action_template: >-
+          {% if is_state('binary_sensor.elco_flame_sensor', 'on') %}heating
+          {% elif is_state('binary_sensor.elco_room_heating_is_active', 'on') %}idle
+          {% else %}idle{% endif %}
+
+        preset_modes:
+          - Automatic
+          - Comfort
+          - Reduced
+        preset_mode_template: "{{ states('input_select.elco_zone_mode_set') }}"
+
+        # Service handlers — route into the existing helpers; AppDaemon
+        # picks up the helper changes and writes to the boiler.
+        set_temperature:
+          - service: input_number.set_value
+            target:
+              entity_id: input_number.elco_ch_comfort_temp_set
+            data:
+              value: "{{ temperature }}"
+
+        set_hvac_mode:
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.elco_zone_mode_set
+            data:
+              option: "{% if hvac_mode == 'off' %}Protection{% else %}Automatic{% endif %}"
+
+        set_preset_mode:
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.elco_zone_mode_set
+            data:
+              option: "{{ preset_mode }}"

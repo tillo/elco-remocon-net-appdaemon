@@ -283,7 +283,7 @@ cards:
       **{{ s }}{% if e != s %}–{{ e }}{% endif %}**&nbsp;&nbsp;{{ fp }}{% if not loop.last %}<br>{% endif %}
       {%- endfor %}
 
-      ☀ Comfort **{{ '%.1f' | format(comfort_t) }}°** · ☾ Reduced **{{ '%.1f' | format(reduced_t) }}°** outside
+      ☀ **{{ '%.1f' | format(comfort_t) }}°** during the hours above · ☾ **{{ '%.1f' | format(reduced_t) }}°** the rest of the day
 
   ##################################################################
   # 4) Hot water card (Hot water screen)
@@ -303,6 +303,14 @@ cards:
         icon: mdi:water-boiler
       - entity: binary_sensor.elco_domestic_hot_water_enabled
         name: Enabled
+      - type: section
+        label: Last 24h
+      - entity: sensor.elco_dhw_storage_temp_min_24h
+        name: Min
+        icon: mdi:thermometer-low
+      - entity: sensor.elco_dhw_storage_temp_max_24h
+        name: Max
+        icon: mdi:thermometer-high
     footer:
       type: graph
       entity: sensor.elco_domestic_hot_water_storage_temperature
@@ -461,6 +469,14 @@ cards:
         name: DHW probe error
       - entity: binary_sensor.elco_room_temperature_error
         name: Room probe error
+      - type: section
+        label: Room temperature, last 48h
+      - entity: sensor.elco_room_temp_min_48h
+        name: Min
+        icon: mdi:thermometer-low
+      - entity: sensor.elco_room_temp_max_48h
+        name: Max
+        icon: mdi:thermometer-high
     footer:
       type: graph
       entity: sensor.elco_room_temperature
